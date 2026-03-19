@@ -5,16 +5,19 @@ emit beyond Evidra-specific use cases.
 
 ## Available Today
 
-- log export over OTLP/HTTP
+- trace export over OTLP gRPC
+- export fanout through a standard OpenTelemetry Collector into OTLP/HTTP
 - request trace and span identifiers
 - MCP method name
 - tool name hints such as `gen_ai.tool.name`
+- resource name hints such as `mcp.resource.name`
 - target hints such as `mcp.target`
-- session hints such as `mcp.session.id`
-- response status hints such as `http.status`
+- session hints such as `mcp.session_id`
+- response status hints such as `http.status_code`
 
 ## Available With Configuration
 
+- direct OTLP/HTTP log export if AgentGateway exposes a log pipeline in the deployment
 - authz decision metadata if AgentGateway is configured to emit generic
   ext-authz attributes into OTEL
 - deployment-specific routing labels carried through standard telemetry config

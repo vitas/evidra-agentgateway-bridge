@@ -13,16 +13,17 @@ import (
 func main() {
 	cfg := config.LoadConfig()
 
-	var consumer otlphttp.RecordConsumer
+	var processor *bridge.Processor
 	if cfg.EvidraBaseURL != "" && cfg.EvidraAPIKey != "" {
-		consumer = bridge.NewProcessor(evidra.NewClient(cfg.EvidraBaseURL, cfg.EvidraAPIKey, nil))
-		log.Printf("forwarding OTLP logs to Evidra at %s", cfg.EvidraBaseURL)
+		processor = bridge.NewProcessor(evidra.NewClient(cfg.EvidraBaseURL, cfg.EvidraAPIKey, nil))
+		log.Printf("forwarding OTLP logs and traces to Evidra at %s", cfg.EvidraBaseURL)
 	} else {
 		log.Printf("starting in accept-only mode; set EVIDRA_BASE_URL and EVIDRA_API_KEY to enable forwarding")
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/logs", otlphttp.NewLogsHandler(consumer))
+	mux.Handle("/v1/logs", otlphttp.NewLogsHandler(processor))
+	mux.Handle("/v1/traces", otlphttp.NewTracesHandler(processor))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))

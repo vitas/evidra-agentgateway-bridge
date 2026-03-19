@@ -1,7 +1,7 @@
 # evidra-agentgateway-bridge
 
-Small public bridge that converts AgentGateway OTEL logs into Evidra external
-ingest calls.
+Small public bridge that converts AgentGateway OpenTelemetry exports into
+Evidra external ingest calls.
 
 ## Goal
 
@@ -14,8 +14,8 @@ exposing benchmark harnesses, scoring internals, or private demo assets.
 
 ## Scope
 
-- receive OTLP/HTTP logs
-- normalize AgentGateway records into observed lifecycle events
+- receive OTLP/HTTP traces and logs
+- normalize AgentGateway telemetry into observed lifecycle events
 - forward typed ingest requests to Evidra
 
 ## Non-Goals
@@ -30,7 +30,8 @@ exposing benchmark harnesses, scoring internals, or private demo assets.
 The MVP currently:
 
 - accepts OTLP/HTTP log exports on `POST /v1/logs`
-- maps AgentGateway-style log records into conservative observed action/outcome events
+- accepts OTLP/HTTP trace exports on `POST /v1/traces`
+- maps AgentGateway-style MCP telemetry into conservative observed action/outcome events
 - forwards typed `prescribe` and `report` ingest calls into Evidra
 - correlates action/outcome pairs in memory using shared session and trace context
 
@@ -52,10 +53,10 @@ Set:
   Bearer token for Evidra ingest
 
 If `EVIDRA_BASE_URL` or `EVIDRA_API_KEY` is missing, the bridge still accepts
-OTLP logs but runs in accept-only mode and does not forward lifecycle events.
+OTLP traffic but runs in accept-only mode and does not forward lifecycle events.
 
 See [examples/bridge.env.example](examples/bridge.env.example) for a minimal
-local setup.
+local setup and the `examples/` configs for the live AgentGateway path.
 
 ## Run
 
@@ -66,7 +67,25 @@ go run ./cmd/bridge
 Endpoints:
 
 - `POST /v1/logs`
+- `POST /v1/traces`
 - `GET /healthz`
+
+## Live AgentGateway Path
+
+The clean minimum chain proven locally is:
+
+`AgentGateway OTLP gRPC -> OTel Collector -> bridge /v1/traces -> Evidra`
+
+Use:
+
+- [examples/agentgateway-config.yaml](examples/agentgateway-config.yaml)
+- [examples/otel-collector-config.yaml](examples/otel-collector-config.yaml)
+
+Notes:
+
+- AgentGateway currently documents OTLP tracing as the primary OpenTelemetry export.
+- The bridge therefore treats traces as the main live integration surface.
+- The log endpoint remains available for fixture replay and fallback experiments.
 
 ## Fixture Replay
 
@@ -94,12 +113,13 @@ Current taxonomy emitted to Evidra:
 
 Current mapping strategy:
 
-- request-style records become `prescribe` ingest calls
-- status-bearing records become `report` ingest calls
+- `tools/call` telemetry becomes `prescribe` + `report` ingest calls
+- session setup traffic such as `initialize` is ignored
 - correlation uses shared session/trace/tool/target fields
 
 ## Notes
 
-- The bridge currently reads log-record attributes only.
+- The bridge is intentionally conservative and currently treats MCP `tools/call`
+  as the actionable lifecycle boundary.
 - The public contract lives in this repo; Evidra internals stay private.
 - Candidate upstream/doc improvements are tracked separately from the MVP.

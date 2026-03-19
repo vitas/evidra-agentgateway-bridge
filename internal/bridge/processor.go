@@ -10,6 +10,7 @@ import (
 	"github.com/vitas/evidra-agentgateway-bridge/internal/evidra"
 	"github.com/vitas/evidra-agentgateway-bridge/internal/normalize"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
+	tracev1 "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 type ingestClient interface {
@@ -36,37 +37,57 @@ func (p *Processor) ConsumeLogRecords(ctx context.Context, records []*logsv1.Log
 	}
 
 	for _, record := range records {
-		mapped := normalize.MapAgentGatewayRecord(record)
-		for _, action := range mapped.Actions {
-			resp, err := p.client.IngestPrescribe(ctx, prescribeRequest(action))
-			if err != nil {
-				return fmt.Errorf("ingest prescribe: %w", err)
-			}
-			p.storePrescription(correlationKey(
-				action.SessionKey,
-				action.TraceID,
-				action.MethodName,
-				action.ToolName,
-				action.Target,
-			), resp.PrescriptionID)
-		}
-		for _, outcome := range mapped.Outcomes {
-			prescriptionID, ok := p.lookupPrescription(correlationKey(
-				outcome.SessionKey,
-				outcome.TraceID,
-				outcome.MethodName,
-				outcome.ToolName,
-				outcome.Target,
-			))
-			if !ok {
-				continue
-			}
-			if _, err := p.client.IngestReport(ctx, reportRequest(outcome, prescriptionID)); err != nil {
-				return fmt.Errorf("ingest report: %w", err)
-			}
+		if err := p.consumeMapped(ctx, normalize.MapAgentGatewayRecord(record)); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+func (p *Processor) ConsumeSpans(ctx context.Context, spans []*tracev1.Span) error {
+	if p == nil || p.client == nil {
+		return nil
+	}
+
+	for _, span := range spans {
+		if err := p.consumeMapped(ctx, normalize.MapAgentGatewaySpan(span)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *Processor) consumeMapped(ctx context.Context, mapped normalize.MappedEvents) error {
+	for _, action := range mapped.Actions {
+		resp, err := p.client.IngestPrescribe(ctx, prescribeRequest(action))
+		if err != nil {
+			return fmt.Errorf("ingest prescribe: %w", err)
+		}
+		p.storePrescription(correlationKey(
+			action.SessionKey,
+			action.TraceID,
+			action.MethodName,
+			action.ToolName,
+			action.Target,
+		), resp.PrescriptionID)
+	}
+	for _, outcome := range mapped.Outcomes {
+		prescriptionID, ok := p.lookupPrescription(correlationKey(
+			outcome.SessionKey,
+			outcome.TraceID,
+			outcome.MethodName,
+			outcome.ToolName,
+			outcome.Target,
+		))
+		if !ok {
+			continue
+		}
+		if _, err := p.client.IngestReport(ctx, reportRequest(outcome, prescriptionID)); err != nil {
+			return fmt.Errorf("ingest report: %w", err)
+		}
+	}
 	return nil
 }
 

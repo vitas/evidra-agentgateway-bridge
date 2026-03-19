@@ -1,0 +1,22 @@
+config:
+  tracing:
+    otlpEndpoint: http://otel-collector:4317
+    randomSampling: true
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - policies:
+        cors:
+          allowOrigins:
+          - "*"
+          allowHeaders:
+          - "*"
+          exposeHeaders:
+          - "Mcp-Session-Id"
+      backends:
+      - mcp:
+          targets:
+          - name: everything
+            mcp:
+              host: http://host.docker.internal:3005/mcp/
