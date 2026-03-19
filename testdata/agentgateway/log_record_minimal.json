@@ -1,0 +1,41 @@
+{
+  "timeUnixNano": "1742383200000000000",
+  "severityText": "INFO",
+  "body": {
+    "stringValue": "agentgateway observed MCP request"
+  },
+  "attributes": [
+    {
+      "key": "mcp.method.name",
+      "value": {
+        "stringValue": "tools/call"
+      }
+    },
+    {
+      "key": "gen_ai.tool.name",
+      "value": {
+        "stringValue": "kubectl_apply"
+      }
+    },
+    {
+      "key": "mcp.target",
+      "value": {
+        "stringValue": "kind-demo"
+      }
+    },
+    {
+      "key": "mcp.session.id",
+      "value": {
+        "stringValue": "session-123"
+      }
+    },
+    {
+      "key": "mcp.resource.type",
+      "value": {
+        "stringValue": "tool"
+      }
+    }
+  ],
+  "traceId": "11111111111111111111111111111111",
+  "spanId": "2222222222222222"
+}
