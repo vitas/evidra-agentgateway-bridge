@@ -81,6 +81,63 @@ func TestProcessorConsumesTraceSpans(t *testing.T) {
 	}
 }
 
+func TestProcessor_GenAIDimensions(t *testing.T) {
+	t.Parallel()
+
+	client := &fakeIngestClient{
+		prescribeResponse: evidra.PrescribeResponse{PrescriptionID: "presc-genai"},
+	}
+	processor := NewProcessor(client)
+
+	spans := []*tracev1.Span{
+		{
+			TraceId:           bytes16(0x55),
+			SpanId:            bytes8(0x66),
+			StartTimeUnixNano: 1742383200000000000,
+			EndTimeUnixNano:   1742383205000000000,
+			Attributes: []*commonv1.KeyValue{
+				stringAttr("mcp.method", "tools/call"),
+				stringAttr("mcp.session_id", "session-genai"),
+				stringAttr("mcp.tool.name", "kubectl_apply"),
+				stringAttr("mcp.target", "kind-demo"),
+				intAttr("http.status_code", 200),
+				stringAttr("gen_ai.response.model", "qwen-plus"),
+				intAttr("gen_ai.usage.prompt_tokens", 1500),
+				intAttr("gen_ai.usage.completion_tokens", 350),
+				intAttr("gen_ai.usage.total_tokens", 1850),
+			},
+		},
+	}
+
+	if err := processor.ConsumeSpans(context.Background(), spans); err != nil {
+		t.Fatalf("ConsumeSpans: %v", err)
+	}
+	if len(client.prescribeRequests) != 1 {
+		t.Fatalf("prescribe requests=%d, want 1", len(client.prescribeRequests))
+	}
+	dims := client.prescribeRequests[0].ScopeDimensions
+	if dims["gen_ai.model"] != "qwen-plus" {
+		t.Errorf("prescribe gen_ai.model=%q, want %q", dims["gen_ai.model"], "qwen-plus")
+	}
+	if dims["gen_ai.prompt_tokens"] != "1500" {
+		t.Errorf("prescribe gen_ai.prompt_tokens=%q, want %q", dims["gen_ai.prompt_tokens"], "1500")
+	}
+	if dims["gen_ai.completion_tokens"] != "350" {
+		t.Errorf("prescribe gen_ai.completion_tokens=%q, want %q", dims["gen_ai.completion_tokens"], "350")
+	}
+	if dims["gen_ai.total_tokens"] != "1850" {
+		t.Errorf("prescribe gen_ai.total_tokens=%q, want %q", dims["gen_ai.total_tokens"], "1850")
+	}
+
+	if len(client.reportRequests) != 1 {
+		t.Fatalf("report requests=%d, want 1", len(client.reportRequests))
+	}
+	rdims := client.reportRequests[0].ScopeDimensions
+	if rdims["gen_ai.model"] != "qwen-plus" {
+		t.Errorf("report gen_ai.model=%q, want %q", rdims["gen_ai.model"], "qwen-plus")
+	}
+}
+
 type fakeIngestClient struct {
 	prescribeResponse evidra.PrescribeResponse
 	prescribeRequests []evidra.PrescribeRequest

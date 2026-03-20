@@ -84,6 +84,54 @@ func TestMapAgentGatewayTraceSpan_IgnoresInitialize(t *testing.T) {
 	}
 }
 
+func TestMapAgentGatewaySpan_GenAIUsage(t *testing.T) {
+	t.Parallel()
+	span := &tracev1.Span{
+		Name:              "tools/call",
+		StartTimeUnixNano: 1000000000,
+		EndTimeUnixNano:   2000000000,
+		TraceId:           bytes16(0xAA),
+		SpanId:            bytes8(0xBB),
+		Status:            &tracev1.Status{Code: tracev1.Status_STATUS_CODE_OK},
+		Attributes: []*commonv1.KeyValue{
+			stringAttr("mcp.method.name", "tools/call"),
+			stringAttr("gen_ai.tool.name", "get_pods"),
+			stringAttr("mcp.target", "demo"),
+			stringAttr("gen_ai.response.model", "qwen-plus"),
+			intAttr("gen_ai.usage.prompt_tokens", 1500),
+			intAttr("gen_ai.usage.completion_tokens", 350),
+			intAttr("gen_ai.usage.total_tokens", 1850),
+		},
+	}
+
+	mapped := MapAgentGatewaySpan(span)
+
+	if len(mapped.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(mapped.Actions))
+	}
+	action := mapped.Actions[0]
+	if action.GenAI.Model != "qwen-plus" {
+		t.Errorf("expected model qwen-plus, got %s", action.GenAI.Model)
+	}
+	if action.GenAI.PromptTokens != "1500" {
+		t.Errorf("expected prompt_tokens 1500, got %s", action.GenAI.PromptTokens)
+	}
+	if action.GenAI.CompletionTokens != "350" {
+		t.Errorf("expected completion_tokens 350, got %s", action.GenAI.CompletionTokens)
+	}
+	if action.GenAI.TotalTokens != "1850" {
+		t.Errorf("expected total_tokens 1850, got %s", action.GenAI.TotalTokens)
+	}
+
+	if len(mapped.Outcomes) != 1 {
+		t.Fatalf("expected 1 outcome, got %d", len(mapped.Outcomes))
+	}
+	outcome := mapped.Outcomes[0]
+	if outcome.GenAI.Model != "qwen-plus" {
+		t.Errorf("outcome model: expected qwen-plus, got %s", outcome.GenAI.Model)
+	}
+}
+
 func mustLoadFixtureRecord(t *testing.T, name string) *logsv1.LogRecord {
 	t.Helper()
 

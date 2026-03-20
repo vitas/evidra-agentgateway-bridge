@@ -8,6 +8,14 @@ const (
 	DefaultSourceSystem = "agentgateway"
 )
 
+// GenAIUsage holds LLM efficiency metrics extracted from gen_ai.* OTLP attributes.
+type GenAIUsage struct {
+	Model            string
+	PromptTokens     string
+	CompletionTokens string
+	TotalTokens      string
+}
+
 type ObservedActionEvent struct {
 	Timestamp    time.Time
 	TraceID      string
@@ -21,6 +29,7 @@ type ObservedActionEvent struct {
 	Flavor       string
 	EvidenceKind string
 	SourceSystem string
+	GenAI        GenAIUsage
 }
 
 type ObservedOutcomeEvent struct {
@@ -37,6 +46,7 @@ type ObservedOutcomeEvent struct {
 	Flavor       string
 	EvidenceKind string
 	SourceSystem string
+	GenAI        GenAIUsage
 }
 
 func NewObservedActionEvent() ObservedActionEvent {

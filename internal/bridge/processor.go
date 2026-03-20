@@ -109,7 +109,7 @@ func (p *Processor) lookupPrescription(key string) (string, bool) {
 
 func prescribeRequest(action normalize.ObservedActionEvent) evidra.PrescribeRequest {
 	key := correlationKey(action.SessionKey, action.TraceID, action.MethodName, action.ToolName, action.Target)
-	return evidra.PrescribeRequest{
+	req := evidra.PrescribeRequest{
 		ContractVersion: evidra.ContractVersionV1,
 		Claim: &evidra.Claim{
 			Source: "agentgateway-bridge",
@@ -134,12 +134,14 @@ func prescribeRequest(action normalize.ObservedActionEvent) evidra.PrescribeRequ
 			Resource:  firstNonEmpty(action.ResourceURI, action.Target, action.ToolName),
 		},
 	}
+	mergeGenAIDimensions(req.ScopeDimensions, action.GenAI)
+	return req
 }
 
 func reportRequest(outcome normalize.ObservedOutcomeEvent, prescriptionID string) evidra.ReportRequest {
 	exitCode, verdict := verdictFromOutcome(outcome)
 	key := correlationKey(outcome.SessionKey, outcome.TraceID, outcome.MethodName, outcome.ToolName, outcome.Target)
-	return evidra.ReportRequest{
+	req := evidra.ReportRequest{
 		ContractVersion: evidra.ContractVersionV1,
 		Claim: &evidra.Claim{
 			Source: "agentgateway-bridge",
@@ -161,6 +163,23 @@ func reportRequest(outcome normalize.ObservedOutcomeEvent, prescriptionID string
 			"target": outcome.Target,
 			"status": outcome.Status,
 		},
+	}
+	mergeGenAIDimensions(req.ScopeDimensions, outcome.GenAI)
+	return req
+}
+
+func mergeGenAIDimensions(dims map[string]string, genai normalize.GenAIUsage) {
+	if genai.Model != "" {
+		dims["gen_ai.model"] = genai.Model
+	}
+	if genai.PromptTokens != "" {
+		dims["gen_ai.prompt_tokens"] = genai.PromptTokens
+	}
+	if genai.CompletionTokens != "" {
+		dims["gen_ai.completion_tokens"] = genai.CompletionTokens
+	}
+	if genai.TotalTokens != "" {
+		dims["gen_ai.total_tokens"] = genai.TotalTokens
 	}
 }
 

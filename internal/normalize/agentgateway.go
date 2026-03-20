@@ -33,6 +33,7 @@ func MapAgentGatewayRecord(record *logsv1.LogRecord) MappedEvents {
 		outcome.Status = firstNonEmpty(attrs["http.status"], attrs["http.status_code"], attrs["otel.status_code"])
 		outcome.ErrorCode = attrs["mcp.error.code"]
 		outcome.ErrorMessage = firstNonEmpty(attrs["mcp.error.message"], attrs["reason"])
+		outcome.GenAI = extractGenAIUsage(attrs)
 		if !hasActionIdentity(ObservedActionEvent{
 			MethodName: outcome.MethodName,
 			ToolName:   outcome.ToolName,
@@ -53,6 +54,7 @@ func MapAgentGatewayRecord(record *logsv1.LogRecord) MappedEvents {
 	action.Target = attrs["mcp.target"]
 	action.ResourceType = attrs["mcp.resource.type"]
 	action.ResourceURI = attrs["mcp.resource.uri"]
+	action.GenAI = extractGenAIUsage(attrs)
 	if !hasActionIdentity(action) {
 		return MappedEvents{}
 	}
@@ -77,6 +79,7 @@ func MapAgentGatewaySpan(span *tracev1.Span) MappedEvents {
 	action.Target = attrs["mcp.target"]
 	action.ResourceType = attrs["mcp.resource.type"]
 	action.ResourceURI = attrs["mcp.resource.uri"]
+	action.GenAI = extractGenAIUsage(attrs)
 	actionable := hasActionIdentity(action)
 	if actionable {
 		mapped.Actions = append(mapped.Actions, action)
@@ -94,6 +97,7 @@ func MapAgentGatewaySpan(span *tracev1.Span) MappedEvents {
 		outcome.Status = firstNonEmpty(attrs["http.status"], attrs["http.status_code"], attrs["otel.status_code"])
 		outcome.ErrorCode = attrs["mcp.error.code"]
 		outcome.ErrorMessage = firstNonEmpty(attrs["mcp.error.message"], attrs["reason"])
+		outcome.GenAI = extractGenAIUsage(attrs)
 		if span.Status != nil {
 			switch span.Status.Code {
 			case tracev1.Status_STATUS_CODE_OK:
@@ -165,6 +169,15 @@ func timestampFromUnixNano(unixNano uint64) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, int64(unixNano)).UTC()
+}
+
+func extractGenAIUsage(attrs map[string]string) GenAIUsage {
+	return GenAIUsage{
+		Model:            firstNonEmpty(attrs["gen_ai.response.model"], attrs["gen_ai.request.model"]),
+		PromptTokens:     attrs["gen_ai.usage.prompt_tokens"],
+		CompletionTokens: attrs["gen_ai.usage.completion_tokens"],
+		TotalTokens:      attrs["gen_ai.usage.total_tokens"],
+	}
 }
 
 func firstNonEmpty(values ...string) string {
