@@ -25,7 +25,7 @@ func TestServer_Export(t *testing.T) {
 	t.Parallel()
 
 	spy := &spyConsumer{}
-	srv := NewServer(spy)
+	srv := NewServer(spy, nil)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -69,7 +69,7 @@ func TestServer_Export(t *testing.T) {
 func TestServer_NilConsumer(t *testing.T) {
 	t.Parallel()
 
-	srv := NewServer(nil)
+	srv := NewServer(nil, nil)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
