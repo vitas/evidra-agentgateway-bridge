@@ -21,11 +21,19 @@ import (
 // Observer identity written onto every execution, so a reader can tell a gateway-observed
 // record from one an Evidra proxy observed without inferring it from the data's shape.
 const (
-	ObserverType     = "agentgateway_otlp"
-	TransportLogs    = "otlp_logs"
-	TransportTraces  = "otlp_traces"
-	SignalLogs       = "logs"
-	SignalTraces     = "traces"
+	ObserverType    = "agentgateway_otlp"
+	TransportLogs   = "otlp_logs"
+	TransportTraces = "otlp_traces"
+	SignalLogs      = "logs"
+	SignalTraces    = "traces"
+
+	// SpanKindClient is the gateway's outbound call to the upstream MCP server, and is the
+	// span that represents the execution. SpanKindServer is the gateway's handling of the
+	// inbound request that caused it. The MCP conventions model one tools/call as both,
+	// parented, and both carry mcp.method.name and gen_ai.tool.name - so without the kind one
+	// execution normalizes into two.
+	SpanKindClient   = "client"
+	SpanKindServer   = "server"
 	methodToolsCall  = "tools/call"
 	toolResourceType = "tool"
 )
@@ -112,6 +120,7 @@ func FromSpan(span *tracev1.Span) (observation.Execution, bool) {
 		TraceID:      firstNonEmpty(hexID(span.TraceId), attrs["trace.id"]),
 		SpanID:       firstNonEmpty(hexID(span.SpanId), attrs["span.id"]),
 		ParentSpanID: hexID(span.ParentSpanId),
+		SpanKind:     spanKindName(span.Kind),
 		Tool:         attr(attrs, "gen_ai.tool.name"),
 		Target:       attrs["mcp.target"],
 		StartedAt:    timestampFromUnixNano(span.StartTimeUnixNano),
@@ -296,4 +305,24 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// spanKindName renders the OTLP span kind. The MCP conventions emit a CLIENT span and a
+// SERVER span for one tools/call, so the kind is what tells them apart; an empty kind means
+// the source did not say, which is recorded as such rather than defaulted to CLIENT.
+func spanKindName(kind tracev1.Span_SpanKind) string {
+	switch kind {
+	case tracev1.Span_SPAN_KIND_CLIENT:
+		return SpanKindClient
+	case tracev1.Span_SPAN_KIND_SERVER:
+		return SpanKindServer
+	case tracev1.Span_SPAN_KIND_INTERNAL:
+		return "internal"
+	case tracev1.Span_SPAN_KIND_PRODUCER:
+		return "producer"
+	case tracev1.Span_SPAN_KIND_CONSUMER:
+		return "consumer"
+	default:
+		return ""
+	}
 }

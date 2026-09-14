@@ -116,6 +116,13 @@ func TestHTTPHandlersFeedTheSinkEndToEnd(t *testing.T) {
 		t.Fatalf("traces export returned %d", resp.Code)
 	}
 
+	// Assembly runs on the merge wait or on shutdown, not on the arrival of a second signal:
+	// the gateway exports spans when they end and access logs when the request completes, and
+	// those are not ordered, so the receiver cannot know a record is complete just because two
+	// signals turned up.
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	written, err := sink.ReadAll(path)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +146,7 @@ func TestHTTPHandlersFeedTheSinkEndToEnd(t *testing.T) {
 	if len(ex.SeenFrom) != 2 {
 		t.Errorf("seen_from = %v, want both signals", ex.SeenFrom)
 	}
-	if stats := p.Stats(); stats.EmittedMerged != 1 || stats.StillPending != 0 {
+	if stats := p.Stats(); stats.EmittedMerged != 1 || stats.StillBuffered != 0 {
 		t.Errorf("stats = %+v", stats)
 	}
 }

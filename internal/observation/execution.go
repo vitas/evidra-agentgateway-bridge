@@ -89,6 +89,11 @@ type Execution struct {
 	TraceID      string `json:"trace_id,omitempty"`
 	SpanID       string `json:"span_id,omitempty"`
 	ParentSpanID string `json:"parent_span_id,omitempty"`
+	// SpanKind records which side of the call the span was emitted from. It is not
+	// decoration: the MCP conventions model one tools/call as a CLIENT span and a SERVER
+	// span, parented, and both carry mcp.method.name and gen_ai.tool.name. Without the kind
+	// the two are indistinguishable and one execution normalizes into two.
+	SpanKind string `json:"span_kind,omitempty"`
 
 	// OperationID is only ever set from an explicit correlation signal. It stays empty when
 	// Correlation is not Correlated, so an empty id and a missing attribution cannot drift

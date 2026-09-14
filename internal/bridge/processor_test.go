@@ -109,8 +109,14 @@ func TestLogAndSpanMergeIntoOneExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if len(sink.written) != 1 {
 		t.Fatalf("wrote %d executions, want exactly 1", len(sink.written))
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 	ex := sink.written[0]
 	if ex.OperationID != opA || ex.Correlation != observation.Correlated {
@@ -134,7 +140,7 @@ func TestLogAndSpanMergeIntoOneExecution(t *testing.T) {
 		t.Errorf("transport = %q, want the merged value", ex.Source.Transport)
 	}
 	stats := p.Stats()
-	if stats.EmittedMerged != 1 || stats.Correlated != 1 || stats.StillPending != 0 {
+	if stats.EmittedMerged != 1 || stats.Correlated != 1 || stats.StillBuffered != 0 {
 		t.Errorf("stats = %+v", stats)
 	}
 }
@@ -149,6 +155,9 @@ func TestMergeIsOrderIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{gatewayLog(t, traceA, spanA, "restart", "alpha", opA)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.written) != 1 {
@@ -172,8 +181,14 @@ func TestConflictingOperationIDsBecomeAmbiguous(t *testing.T) {
 	if err := p.ConsumeSpans(ctx, []*tracev1.Span{gatewaySpan(t, traceA, spanA, "restart", "alpha", opB, tracev1.Status_STATUS_CODE_UNSET)}); err != nil {
 		t.Fatal(err)
 	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if len(sink.written) != 1 {
 		t.Fatalf("wrote %d, want 1", len(sink.written))
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 	ex := sink.written[0]
 	if ex.Correlation != observation.Ambiguous {
@@ -230,8 +245,14 @@ func TestConcurrentOperationsDoNotCrossCorrelate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if len(sink.written) != 2 {
 		t.Fatalf("wrote %d executions, want 2", len(sink.written))
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 	byOp := map[string]observation.Execution{}
 	for _, ex := range sink.written {
@@ -259,6 +280,9 @@ func TestStatusDisagreementKeepsTheFailureAndSaysSo(t *testing.T) {
 		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_ERROR,
 			kv("error.type", "tool_error")),
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	ex := sink.written[0]
@@ -296,6 +320,9 @@ func TestRefusedRawPayloadSurvivesTheMerge(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	ex := sink.written[0]
 	if ex.ArgumentsFingerprintStatus != observation.RefusedRaw {
 		t.Errorf("arguments availability = %s, want refused_raw_present_at_source", ex.ArgumentsFingerprintStatus)
@@ -320,7 +347,7 @@ func TestFlushEmitsSingleSignalPartials(t *testing.T) {
 	if len(sink.written) != 0 {
 		t.Fatal("emitted a partial before flush with maxWait=0")
 	}
-	if p.Stats().StillPending != 1 {
+	if p.Stats().StillBuffered != 1 {
 		t.Errorf("stats = %+v, want 1 pending", p.Stats())
 	}
 	if err := p.Flush(ctx); err != nil {
@@ -328,6 +355,9 @@ func TestFlushEmitsSingleSignalPartials(t *testing.T) {
 	}
 	if len(sink.written) != 1 {
 		t.Fatalf("flush wrote %d, want 1", len(sink.written))
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
 	}
 	ex := sink.written[0]
 	if strings.Join(ex.SeenFrom, ",") != "logs" {
@@ -409,5 +439,206 @@ func TestObserverIdentityIsStamped(t *testing.T) {
 	}
 	if src.ObserverType != "agentgateway_otlp" {
 		t.Errorf("observer type = %q", src.ObserverType)
+	}
+}
+
+// clientSpan and serverSpan reproduce the pair AgentGateway v1.5.0 emits for one tools/call,
+// measured during BR-1: the client span is the outbound call to the upstream and is exported
+// first, and the server span is the trace root that carries the CEL-projected operation id
+// because the projection reads the inbound request headers.
+func clientSpan(t *testing.T, traceID, spanID, parentID, tool, target string) *tracev1.Span {
+	t.Helper()
+	s := gatewaySpan(t, traceID, spanID, tool, target, "", tracev1.Status_STATUS_CODE_UNSET)
+	s.ParentSpanId = raw(t, parentID)
+	s.Kind = tracev1.Span_SPAN_KIND_CLIENT
+	return s
+}
+
+func serverSpan(t *testing.T, traceID, spanID, tool, target, opID string) *tracev1.Span {
+	t.Helper()
+	s := gatewaySpan(t, traceID, spanID, tool, target, opID, tracev1.Status_STATUS_CODE_UNSET)
+	s.Kind = tracev1.Span_SPAN_KIND_SERVER
+	return s
+}
+
+// TestOneToolCallIsOneExecution is the BR-1 defect. One tools/call through AgentGateway emits a
+// client span and a server span, both carrying mcp.method.name and gen_ai.tool.name, so a
+// receiver that normalizes per span reports two executions for one call. Deduplicating on
+// tool+target+time would be the heuristic the correlation contract forbids; the parent link is
+// trace structure the source asserted, so that is what is used.
+func TestOneToolCallIsOneExecution(t *testing.T) {
+	const (
+		serverSpanID = "ffffffffffffffff"
+		clientSpanID = "eeeeeeeeeeeeeeee"
+	)
+	for _, tc := range []struct {
+		name  string
+		first func(t *testing.T) *tracev1.Span
+		then  func(t *testing.T) *tracev1.Span
+	}{
+		{
+			// The order actually observed: the client span ends first, so it is exported first.
+			name: "client span arrives before its parent",
+			first: func(t *testing.T) *tracev1.Span {
+				return clientSpan(t, traceA, clientSpanID, serverSpanID, "restart", "alpha")
+			},
+			then: func(t *testing.T) *tracev1.Span { return serverSpan(t, traceA, serverSpanID, "restart", "alpha", opA) },
+		},
+		{
+			name:  "server span arrives first",
+			first: func(t *testing.T) *tracev1.Span { return serverSpan(t, traceA, serverSpanID, "restart", "alpha", opA) },
+			then: func(t *testing.T) *tracev1.Span {
+				return clientSpan(t, traceA, clientSpanID, serverSpanID, "restart", "alpha")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &recordingSink{}
+			p := NewProcessor(sink, 0)
+			ctx := context.Background()
+
+			if err := p.ConsumeSpans(ctx, []*tracev1.Span{tc.first(t)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.ConsumeSpans(ctx, []*tracev1.Span{tc.then(t)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			if len(sink.written) != 1 {
+				t.Fatalf("one tools/call produced %d executions: %+v", len(sink.written), sink.written)
+			}
+			if err := p.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			ex := sink.written[0]
+			// The correlation lives on the parent; the execution facts on the child. Losing
+			// either half makes the record useless in a different way.
+			if ex.Correlation != observation.Correlated || ex.OperationID != opA {
+				t.Errorf("correlation = %s/%q, want the parent span's id adopted (%s)", ex.Correlation, ex.OperationID, opA)
+			}
+			if ex.Tool != "restart" || ex.Target != "alpha" {
+				t.Errorf("tool/target = %q/%q", ex.Tool, ex.Target)
+			}
+			if ex.SpanID != clientSpanID {
+				t.Errorf("span = %q, want the client span %q - the outbound call is the execution", ex.SpanID, clientSpanID)
+			}
+			if ex.SpanKind != "client" {
+				t.Errorf("span kind = %q, want client", ex.SpanKind)
+			}
+		})
+	}
+}
+
+// TestSingleSpanDeploymentStillProducesARecord guards the other side of the dedup rule: a
+// gateway that emits one span per call, with no client/server pair, must not have its execution
+// suppressed as somebody's parent.
+func TestSingleSpanDeploymentStillProducesARecord(t *testing.T) {
+	sink := &recordingSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+
+	s := gatewaySpan(t, traceA, spanA, "restart", "alpha", opA, tracev1.Status_STATUS_CODE_UNSET)
+	s.Kind = tracev1.Span_SPAN_KIND_INTERNAL
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{s}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 1 {
+		t.Fatalf("wrote %d, want 1", len(sink.written))
+	}
+	if sink.written[0].Correlation != observation.Correlated {
+		t.Errorf("correlation = %s", sink.written[0].Correlation)
+	}
+}
+
+// TestMergingTwoSpansDoesNotClaimALogItNeverSaw covers a reporting bug found while fixing the
+// duplicate: the merged transport was hardcoded to "otlp_logs+otlp_traces", so two spans of one
+// signal produced a record claiming an access log had contributed to it.
+func TestMergingTwoSpansDoesNotClaimALogItNeverSaw(t *testing.T) {
+	sink := &recordingSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		clientSpan(t, traceA, "eeeeeeeeeeeeeeee", "ffffffffffffffff", "restart", "alpha"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		serverSpan(t, traceA, "ffffffffffffffff", "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 1 {
+		t.Fatalf("wrote %d, want 1", len(sink.written))
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ex := sink.written[0]
+	if ex.Source.Transport != "otlp_traces" {
+		t.Errorf("transport = %q, want otlp_traces - no access log was seen", ex.Source.Transport)
+	}
+	if strings.Join(ex.SeenFrom, ",") != "traces" {
+		t.Errorf("seen_from = %v, want [traces]", ex.SeenFrom)
+	}
+}
+
+// TestLogArrivingBeforeTheClientSpanStillMerges is the ordering BR-1 actually observed. The
+// access log carries the server span's id, so it is buffered under the parent's key; the client
+// span that represents the execution arrives afterwards and claims that parent. A receiver that
+// only redirects records arriving after the claim exists emits the log as a second execution,
+// which is what the first BR-1 run produced: seven records for six calls.
+func TestLogArrivingBeforeTheClientSpanStillMerges(t *testing.T) {
+	const (
+		serverSpanID = "ffffffffffffffff"
+		clientSpanID = "eeeeeeeeeeeeeeee"
+	)
+	sink := &recordingSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, serverSpanID, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		clientSpan(t, traceA, clientSpanID, serverSpanID, "restart", "alpha"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		serverSpan(t, traceA, serverSpanID, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sink.written) != 1 {
+		t.Fatalf("one tools/call produced %d executions: %+v", len(sink.written), sink.written)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ex := sink.written[0]
+	if ex.Correlation != observation.Correlated || ex.OperationID != opA {
+		t.Errorf("correlation = %s/%q", ex.Correlation, ex.OperationID)
+	}
+	if len(ex.SeenFrom) != 2 {
+		t.Errorf("seen_from = %v, want the log and the spans merged", ex.SeenFrom)
+	}
+	if stats := p.Stats(); stats.StillBuffered != 0 {
+		t.Errorf("stats = %+v", stats)
 	}
 }

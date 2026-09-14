@@ -1,9 +1,16 @@
 // Package bridge turns normalized observations into records for a sink.
 //
-// It owns two things and nothing else: joining the signals that describe one execution, and
-// deciding when a joined record is complete enough to emit. It does not decide what an
-// execution means, and it does not classify anything about the tool, its arguments or its
-// result.
+// It owns two things and nothing else: assembling the signals that describe one execution, and
+// deciding when an assembly is final. It does not decide what an execution means, and it does
+// not classify anything about the tool, its arguments or its result.
+//
+// Assembly happens in one pass over buffered signals rather than incrementally as each signal
+// arrives. That is a deliberate choice made after an incremental version was measured against a
+// real AgentGateway: the gateway exports spans when they end and access logs when the request
+// completes, and the two are not ordered with respect to each other. An incremental receiver has
+// to guess whether a record is complete, and every ordering it did not anticipate produced a
+// second record for one tool call - measured at 7 and then 8 records for 6 calls. Buffering and
+// assembling once removes the ordering question entirely, at the cost of a bounded delay.
 package bridge
 
 import (
@@ -21,15 +28,14 @@ import (
 )
 
 // Sink receives one normalized execution at a time. It is an interface so the writer can be
-// swapped without touching correlation: today it appends JSONL for inspection and parity
-// runs, and the Evidence v2 writer lands behind the same signature.
+// swapped without touching assembly: today it appends JSONL for inspection and parity runs, and
+// the Evidence v2 writer lands behind the same signature.
 type Sink interface {
 	Write(ctx context.Context, ex observation.Execution) error
 }
 
-// Stats counts what the join actually did. It exists because a receiver that silently drops
-// or silently half-merges looks identical to one that works: the numbers are the only way to
-// tell them apart from the outside.
+// Stats counts what the assembly actually did. It exists because a receiver that silently drops
+// or silently half-assembles looks identical from outside to one that works.
 type Stats struct {
 	LogRecordsSeen   int `json:"log_records_seen"`
 	SpansSeen        int `json:"spans_seen"`
@@ -39,23 +45,17 @@ type Stats struct {
 	EmittedLogOnly   int `json:"emitted_log_only"`
 	EmittedSpanOnly  int `json:"emitted_span_only"`
 	UnjoinableNoSpan int `json:"unjoinable_missing_span_id"`
-	Correlated       int `json:"correlated"`
-	Unattributed     int `json:"unattributed"`
-	Ambiguous        int `json:"ambiguous"`
-	StillPending     int `json:"still_pending"`
+	// ParentsSuppressed counts spans not emitted because a client span in the same trace claimed
+	// them as parent. One tools/call is two spans; without this the receiver reports twice the
+	// executions that happened, which reads as coverage rather than as duplication.
+	ParentsSuppressed int `json:"parent_spans_suppressed"`
+	Correlated        int `json:"correlated"`
+	Unattributed      int `json:"unattributed"`
+	Ambiguous         int `json:"ambiguous"`
+	StillBuffered     int `json:"still_buffered"`
 }
 
-type pending struct {
-	ex        observation.Execution
-	firstSeen time.Time
-}
-
-// Processor joins log records and spans on their shared trace and span id.
-//
-// The join key requires both. AgentGateway sets trace and span context on the OTLP log
-// record it exports, so one request's log and span carry the same pair; joining on trace id
-// alone would be a heuristic, because a single trace normally contains several tool calls and
-// an operation id would land on whichever execution merged first.
+// Processor buffers normalized signals and assembles executions from them.
 type Processor struct {
 	sink    Sink
 	maxWait time.Duration
@@ -64,25 +64,31 @@ type Processor struct {
 	mu              sync.Mutex
 	observerID      string
 	observerVersion string
-	pending         map[string]pending
+	spans           map[string]observation.Execution
+	logs            map[string]observation.Execution
+	firstSeen       map[string]time.Time
+	emitted         map[string]bool
 	stats           Stats
 }
 
-// NewProcessor returns a processor that emits to sink. maxWait bounds how long a record seen
-// on only one signal waits for the other before being emitted as partial; zero means partial
-// records are held until Flush.
+// NewProcessor returns a processor that emits to sink. maxWait is how long a signal is held
+// waiting for the rest of its execution before assembly runs without it; zero assembles only on
+// Flush, which is what makes the tests deterministic.
 func NewProcessor(sink Sink, maxWait time.Duration) *Processor {
 	return &Processor{
-		sink:    sink,
-		maxWait: maxWait,
-		now:     time.Now,
-		pending: map[string]pending{},
+		sink:      sink,
+		maxWait:   maxWait,
+		now:       time.Now,
+		spans:     map[string]observation.Execution{},
+		logs:      map[string]observation.Execution{},
+		firstSeen: map[string]time.Time{},
+		emitted:   map[string]bool{},
 	}
 }
 
 // SetObserver stamps an observer identity onto every execution this processor emits. It is set
-// once at startup: two receivers writing to one store must be distinguishable afterwards, and
-// "the gateway observed this" is not enough when there are two gateways.
+// once at startup: two receivers writing one store must be distinguishable afterwards, and "the
+// gateway observed this" is not enough when there are two gateways.
 func (p *Processor) SetObserver(id, version string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -101,11 +107,9 @@ func (p *Processor) ConsumeLogRecords(ctx context.Context, records []*logsv1.Log
 			p.count(func(s *Stats) { s.ToolCallsIgnored++ })
 			continue
 		}
-		if err := p.ingest(ctx, ex); err != nil {
-			return err
-		}
+		p.buffer(ex, normalize.SignalLogs)
 	}
-	return p.evictExpired(ctx)
+	return p.assembleExpired(ctx)
 }
 
 func (p *Processor) ConsumeSpans(ctx context.Context, spans []*tracev1.Span) error {
@@ -119,40 +123,22 @@ func (p *Processor) ConsumeSpans(ctx context.Context, spans []*tracev1.Span) err
 			p.count(func(s *Stats) { s.ToolCallsIgnored++ })
 			continue
 		}
-		if err := p.ingest(ctx, ex); err != nil {
-			return err
-		}
+		p.buffer(ex, normalize.SignalTraces)
 	}
-	return p.evictExpired(ctx)
+	return p.assembleExpired(ctx)
 }
 
-// Flush emits everything still waiting for a second signal. A run that ends without it leaves
-// the single-signal executions unreported, which is the same shape as a receiver that dropped
-// them.
+// Flush assembles everything still buffered. A run that ends without it reports a coverage gap
+// that was really a lifecycle bug.
 func (p *Processor) Flush(ctx context.Context) error {
-	if p == nil {
-		return nil
-	}
-	p.mu.Lock()
-	keys := make([]string, 0, len(p.pending))
-	for k := range p.pending {
-		keys = append(keys, k)
-	}
-	p.mu.Unlock()
-	sort.Strings(keys)
-	for _, k := range keys {
-		if err := p.emitKey(ctx, k); err != nil {
-			return err
-		}
-	}
-	return nil
+	return p.assemble(ctx, time.Time{})
 }
 
 func (p *Processor) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := p.stats
-	s.StillPending = len(p.pending)
+	s.StillBuffered = len(p.firstSeen)
 	return s
 }
 
@@ -162,92 +148,201 @@ func (p *Processor) count(fn func(*Stats)) {
 	fn(&p.stats)
 }
 
-func (p *Processor) ingest(ctx context.Context, ex observation.Execution) error {
+func (p *Processor) buffer(ex observation.Execution, signal string) {
 	key := observation.JoinKey(ex.TraceID, ex.SpanID)
 	if key == "" {
-		// No span id means nothing to join on. Emitting it anyway would put a record in the
-		// store that can never be corroborated; dropping it silently would hide a source that
-		// stopped setting trace context. Count it and drop it, and let the number be visible.
+		// Nothing to assemble on. Emitting it would put a record in the store that can never be
+		// corroborated; dropping it quietly would hide a source that stopped setting trace
+		// context. Count it and drop it, and let the number be visible.
 		p.count(func(s *Stats) { s.UnjoinableNoSpan++ })
-		return nil
+		return
 	}
-
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.emitted[key] {
+		return
+	}
 	if p.observerID != "" {
 		ex.Source.ObserverID = p.observerID
 		ex.Source.ObserverVersion = p.observerVersion
 	}
-	prev, exists := p.pending[key]
-	if !exists {
-		p.pending[key] = pending{ex: ex, firstSeen: p.now()}
-		p.mu.Unlock()
-		return nil
+	dst := p.spans
+	if signal == normalize.SignalLogs {
+		dst = p.logs
 	}
-	merged := merge(prev.ex, ex)
-	delete(p.pending, key)
-	p.mu.Unlock()
-	return p.emit(ctx, merged, true)
+	if prev, ok := dst[key]; ok {
+		ex = merge(prev, ex)
+	}
+	dst[key] = ex
+	if _, ok := p.firstSeen[key]; !ok {
+		p.firstSeen[key] = p.now()
+	}
 }
 
-func (p *Processor) evictExpired(ctx context.Context) error {
+func (p *Processor) assembleExpired(ctx context.Context) error {
 	if p.maxWait <= 0 {
 		return nil
 	}
-	cutoff := p.now().Add(-p.maxWait)
+	return p.assemble(ctx, p.now().Add(-p.maxWait))
+}
+
+// assemble builds executions from the buffered signals and writes them. A zero cutoff assembles
+// everything, which is what Flush does; otherwise only keys first seen before the cutoff are
+// assembled, so signals still in flight get a chance to join.
+//
+// The rule for what counts as one execution, measured against AgentGateway v1.5.0 in BR-1:
+//
+//	one tools/call  ->  a server span: the gateway's inbound handling, the trace root, and the
+//	                    carrier of the CEL-projected operation id, because the projection reads
+//	                    the inbound request headers
+//	                ->  a client span: the outbound call to the upstream, parented to it
+//	                ->  one access-log record, carrying the server span's id
+//
+// The execution is the client span, because that is the call that reached the upstream. The
+// server span is suppressed and contributes its correlation; the access log follows whichever
+// span carries its id, and its contribution ends up on the client span. Deduplicating on
+// tool+target+time instead would be exactly the heuristic the correlation contract forbids; the
+// parent link is trace structure the source asserted.
+func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 	p.mu.Lock()
-	var keys []string
-	for k, v := range p.pending {
-		if v.firstSeen.Before(cutoff) {
-			keys = append(keys, k)
+	ready := p.readyKeys(cutoff)
+	if len(ready) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+
+	// childOf maps a parent span key to the client span naming it as parent, across all buffered
+	// spans and not only the ready ones: a parent may age out while its child is still inside the
+	// wait, and suppressing the parent is correct either way.
+	childOf := map[string]string{}
+	for key, span := range p.spans {
+		if span.SpanKind == normalize.SpanKindClient && span.ParentSpanID != "" {
+			childOf[span.TraceID+"/"+span.ParentSpanID] = key
 		}
 	}
+
+	type assembled struct {
+		key   string
+		ex    observation.Execution
+		both  bool
+		loggy bool
+	}
+	var out []assembled
+	consumed := map[string]bool{}
+
+	for _, key := range ready {
+		if consumed[key] {
+			continue
+		}
+		// A span or log keyed by a parent span id that a client span claims is not an
+		// execution of its own. The access log carries the server span's id, so it lands
+		// under the parent's key; the execution is the client span, and the log's data
+		// belongs there. An incremental receiver missed this because the log arrived before
+		// the claim existed; assembling once over all buffered signals removes the ordering
+		// question entirely.
+		if childKey, claimed := childOf[key]; claimed && childKey != key {
+			consumed[key] = true
+			if _, hasSpan := p.spans[key]; hasSpan {
+				p.stats.ParentsSuppressed++
+			}
+			if logRec, ok := p.logs[key]; ok {
+				if child, ok := p.spans[childKey]; ok {
+					p.spans[childKey] = merge(child, logRec)
+				}
+				delete(p.logs, key)
+			}
+			continue
+		}
+
+		span, hasSpan := p.spans[key]
+		logRec, hasLog := p.logs[key]
+		if !hasSpan && !hasLog {
+			consumed[key] = true
+			continue
+		}
+
+		ex := logRec
+		if hasSpan {
+			ex = span
+			// A client span takes its correlation from its parent, which is where the
+			// projected operation id lands.
+			if span.SpanKind == normalize.SpanKindClient && span.ParentSpanID != "" {
+				parentKey := span.TraceID + "/" + span.ParentSpanID
+				if parent, ok := p.spans[parentKey]; ok {
+					ex = merge(ex, parent)
+				}
+				if parentLog, ok := p.logs[parentKey]; ok {
+					ex = merge(ex, parentLog)
+				}
+				consumed[parentKey] = true
+			}
+			if hasLog {
+				ex = merge(ex, logRec)
+			}
+		}
+		consumed[key] = true
+		out = append(out, assembled{key: key, ex: ex, both: hasSpan && hasLog, loggy: !hasSpan})
+	}
+
+	for key := range consumed {
+		delete(p.spans, key)
+		delete(p.logs, key)
+		delete(p.firstSeen, key)
+	}
 	p.mu.Unlock()
-	sort.Strings(keys)
-	for _, k := range keys {
-		if err := p.emitKey(ctx, k); err != nil {
+
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	for _, a := range out {
+		if err := p.emit(ctx, a.key, a.ex, a.both || len(a.ex.SeenFrom) > 1, a.loggy); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (p *Processor) emitKey(ctx context.Context, key string) error {
-	p.mu.Lock()
-	item, ok := p.pending[key]
-	if ok {
-		delete(p.pending, key)
+// readyKeys returns buffered keys whose wait has elapsed, in a stable order.
+func (p *Processor) readyKeys(cutoff time.Time) []string {
+	keys := make([]string, 0, len(p.firstSeen))
+	for key, seen := range p.firstSeen {
+		if cutoff.IsZero() || seen.Before(cutoff) {
+			keys = append(keys, key)
+		}
 	}
-	p.mu.Unlock()
-	if !ok {
-		return nil
-	}
-	return p.emit(ctx, item.ex, false)
+	sort.Strings(keys)
+	return keys
 }
 
-func (p *Processor) emit(ctx context.Context, ex observation.Execution, merged bool) error {
-	switch ex.Correlation {
-	case observation.Correlated:
-		p.count(func(s *Stats) { s.Correlated++ })
-	case observation.Ambiguous:
-		p.count(func(s *Stats) { s.Ambiguous++ })
-	default:
-		p.count(func(s *Stats) { s.Unattributed++ })
-	}
-	p.count(func(s *Stats) {
-		s.Emitted++
-		switch {
-		case merged:
-			s.EmittedMerged++
-		case len(ex.SeenFrom) == 1 && ex.SeenFrom[0] == normalize.SignalLogs:
-			s.EmittedLogOnly++
-		default:
-			s.EmittedSpanOnly++
-		}
-	})
-	if p.sink == nil {
+func (p *Processor) emit(ctx context.Context, key string, ex observation.Execution, merged, logOnly bool) error {
+	p.mu.Lock()
+	if p.emitted[key] {
+		p.mu.Unlock()
 		return nil
 	}
-	if err := p.sink.Write(ctx, ex); err != nil {
+	p.emitted[key] = true
+	switch ex.Correlation {
+	case observation.Correlated:
+		p.stats.Correlated++
+	case observation.Ambiguous:
+		p.stats.Ambiguous++
+	default:
+		p.stats.Unattributed++
+	}
+	p.stats.Emitted++
+	switch {
+	case merged:
+		p.stats.EmittedMerged++
+	case logOnly:
+		p.stats.EmittedLogOnly++
+	default:
+		p.stats.EmittedSpanOnly++
+	}
+	sink := p.sink
+	p.mu.Unlock()
+
+	if sink == nil {
+		return nil
+	}
+	if err := sink.Write(ctx, ex); err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
 	return nil
@@ -264,8 +359,16 @@ func merge(base, add observation.Execution) observation.Execution {
 	if out.TraceID == "" {
 		out.TraceID = add.TraceID
 	}
+	if out.SpanID == "" {
+		out.SpanID = add.SpanID
+	}
 	if out.ParentSpanID == "" {
 		out.ParentSpanID = add.ParentSpanID
+	}
+	// A log record carries no span kind. Taking the span's is what lets assembly tell an
+	// execution from the gateway's own handling of the request that caused it.
+	if out.SpanKind == "" {
+		out.SpanKind = add.SpanKind
 	}
 	out.Tool = mergeField("tool", base.Tool, add.Tool, &dis)
 	out.Target = mergeField("target", base.Target, add.Target, &dis)
@@ -288,16 +391,12 @@ func merge(base, add observation.Execution) observation.Execution {
 	out.ArgumentsFingerprintStatus = strongerAvailability(base.ArgumentsFingerprintStatus, add.ArgumentsFingerprintStatus)
 	out.ResultFingerprintStatus = strongerAvailability(base.ResultFingerprintStatus, add.ResultFingerprintStatus)
 
-	if out.ReadOnlyAnnotationKnown && !add.ReadOnlyAnnotationKnown {
-		// keep base
-	} else if add.ReadOnlyAnnotationKnown {
+	if add.ReadOnlyAnnotationKnown {
 		out.ReadOnlyDeclared = add.ReadOnlyDeclared
 		out.ReadOnlyAnnotationKnown = true
 	}
 	out.Source = mergeSource(base.Source, add.Source)
-	if len(base.SeenFrom) > 0 && len(add.SeenFrom) > 0 {
-		out.Source.Transport = "otlp_logs+otlp_traces"
-	}
+	out.Source.Transport = transportOf(out.SeenFrom)
 	out.Disagreements = dis
 	return out
 }
@@ -335,7 +434,8 @@ func mergeStatus(base, add observation.Execution, dis *[]string) (observation.St
 func mergeCorrelation(base, add observation.Execution) (observation.Correlation, string, string) {
 	if base.Correlation == observation.Ambiguous || add.Correlation == observation.Ambiguous {
 		detail := firstNonEmpty(base.CorrelationDetail, add.CorrelationDetail)
-		if base.Correlation == observation.Ambiguous && add.Correlation == observation.Ambiguous {
+		if base.Correlation == observation.Ambiguous && add.Correlation == observation.Ambiguous &&
+			base.CorrelationDetail != add.CorrelationDetail {
 			detail = base.CorrelationDetail + "; " + add.CorrelationDetail
 		}
 		return observation.Ambiguous, "", detail
@@ -344,8 +444,8 @@ func mergeCorrelation(base, add observation.Execution) (observation.Correlation,
 }
 
 // strongerAvailability keeps the more informative statement. That a source offered raw content
-// and the bridge declined is a stronger claim than that the source emitted nothing, and
-// dropping it during a merge would erase exactly the evidence a privacy canary looks for.
+// and the bridge declined is a stronger claim than that the source emitted nothing, and dropping
+// it during a merge would erase exactly the evidence a privacy canary looks for.
 func strongerAvailability(a, b observation.Availability) observation.Availability {
 	rank := func(v observation.Availability) int {
 		switch v {
@@ -399,6 +499,23 @@ func mergeField(name, a, b string, dis *[]string) string {
 	}
 	*dis = append(*dis, fmt.Sprintf("%s: signals disagreed (%q vs %q)", name, a, b))
 	return a
+}
+
+// transportOf names the signals a record was built from. Deriving it rather than hardcoding a
+// two-signal value is what keeps a merged pair of spans from claiming it saw an access log.
+func transportOf(seenFrom []string) string {
+	switch len(seenFrom) {
+	case 0:
+		return ""
+	case 1:
+		return "otlp_" + seenFrom[0]
+	default:
+		parts := make([]string, 0, len(seenFrom))
+		for _, s := range seenFrom {
+			parts = append(parts, "otlp_"+s)
+		}
+		return strings.Join(parts, "+")
+	}
 }
 
 func union(a, b []string) []string {
