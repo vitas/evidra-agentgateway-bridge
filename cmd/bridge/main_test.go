@@ -83,22 +83,24 @@ func TestShutdownServicesForcesStuckGRPCStopAtDeadline(t *testing.T) {
 	}
 }
 
-type deadlineFlush struct {
+type blockedFlush struct {
 	started  chan struct{}
+	release  chan struct{}
 	returned chan struct{}
 }
 
-func (f *deadlineFlush) Flush(ctx context.Context) error {
+func (f *blockedFlush) Flush(context.Context) error {
 	close(f.started)
-	<-ctx.Done()
+	<-f.release
 	close(f.returned)
-	return ctx.Err()
+	return nil
 }
 
-func TestShutdownServicesDoesNotWaitPastDeadlineForSlowFlush(t *testing.T) {
+func TestShutdownServicesDoesNotWaitPastDeadlineForNonCooperativeFlush(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	flusher := &deadlineFlush{
+	flusher := &blockedFlush{
 		started:  make(chan struct{}),
+		release:  make(chan struct{}),
 		returned: make(chan struct{}),
 	}
 	done := make(chan shutdownResult, 1)
@@ -111,16 +113,59 @@ func TestShutdownServicesDoesNotWaitPastDeadlineForSlowFlush(t *testing.T) {
 
 	select {
 	case result := <-done:
+		if !errors.Is(result.flushErr, errFlushDeadline) {
+			t.Fatalf("flush error = %v, want flush deadline error", result.flushErr)
+		}
 		if !errors.Is(result.flushErr, context.Canceled) {
-			t.Fatalf("flush error = %v, want context canceled", result.flushErr)
+			t.Fatalf("flush error = %v, want context cancellation cause", result.flushErr)
+		}
+		if !result.flushTimedOut {
+			t.Fatal("shutdown did not report a timed-out flush")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("slow flush blocked shutdown after its context was canceled")
+		t.Fatal("non-cooperative flush blocked shutdown after its context was canceled")
 	}
 
+	close(flusher.release)
 	select {
 	case <-flusher.returned:
 	case <-time.After(time.Second):
-		t.Fatal("flush had not returned when shutdown completed")
+		t.Fatal("released flush goroutine did not exit")
+	}
+}
+
+type cooperativeFlush struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *cooperativeFlush) Flush(context.Context) error {
+	close(f.started)
+	<-f.release
+	return nil
+}
+
+func TestFlushProcessorWaitsForNormalFlushCompletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	flusher := &cooperativeFlush{started: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() { done <- flushProcessor(ctx, flusher) }()
+
+	<-flusher.started
+	select {
+	case err := <-done:
+		t.Fatalf("flush returned before persistence completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(flusher.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("flush error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completed flush did not return")
 	}
 }

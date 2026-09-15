@@ -24,6 +24,8 @@ import (
 
 const shutdownTimeout = 10 * time.Second
 
+var errFlushDeadline = errors.New("flush did not complete before the shutdown deadline; buffered records are not confirmed durable")
+
 type httpShutdowner interface {
 	Shutdown(context.Context) error
 }
@@ -33,16 +35,15 @@ type grpcShutdowner interface {
 	Stop()
 }
 
-// processorFlusher follows the usual context contract: it must stop work and return when ctx
-// is canceled. Keeping Flush synchronous guarantees no writer survives run's return.
 type processorFlusher interface {
 	Flush(context.Context) error
 }
 
 type shutdownResult struct {
-	httpErr    error
-	flushErr   error
-	grpcForced bool
+	httpErr       error
+	flushErr      error
+	grpcForced    bool
+	flushTimedOut bool
 }
 
 func main() {
@@ -61,7 +62,11 @@ func run(args []string, stdout io.Writer) int {
 	if err != nil {
 		log.Fatalf("observations sink: %v", err)
 	}
+	closeOutput := true
 	defer func() {
+		if !closeOutput {
+			return
+		}
 		if err := out.Close(); err != nil {
 			log.Printf("close observations sink: %v", err)
 		}
@@ -119,6 +124,12 @@ func run(args []string, stdout io.Writer) int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	result := shutdownServices(shutdownCtx, server, grpcSrv, processor)
+	if result.flushTimedOut {
+		// run is called only by main, which immediately calls os.Exit with its result. Do not
+		// race Close against a regular-file write that ignored cancellation; process exit is
+		// the only safe hard stop available for such an I/O operation.
+		closeOutput = false
+	}
 	if result.httpErr != nil {
 		log.Printf("HTTP shutdown: %v", result.httpErr)
 	}
@@ -130,7 +141,11 @@ func run(args []string, stdout io.Writer) int {
 	}
 	stats := processor.Stats()
 	raw, _ := json.Marshal(stats)
-	log.Printf("final stats: %s", raw)
+	if result.flushTimedOut {
+		log.Printf("stats at shutdown deadline (persistence not confirmed): %s", raw)
+	} else {
+		log.Printf("final stats: %s", raw)
+	}
 
 	return 0
 }
@@ -144,6 +159,7 @@ func shutdownServices(
 	result := shutdownResult{httpErr: httpServer.Shutdown(ctx)}
 	result.grpcForced = stopGRPC(ctx, grpcServer)
 	result.flushErr = flushProcessor(ctx, processor)
+	result.flushTimedOut = errors.Is(result.flushErr, errFlushDeadline)
 	return result
 }
 
@@ -167,7 +183,22 @@ func stopGRPC(ctx context.Context, server grpcShutdowner) bool {
 
 func flushProcessor(ctx context.Context, processor processorFlusher) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errFlushDeadline, err)
 	}
-	return processor.Flush(ctx)
+
+	// Regular-file writes cannot be forcibly interrupted by canceling a context. Bound the
+	// caller anyway: in the CLI/PID1 lifecycle main immediately os.Exit's after run returns.
+	// The buffered result channel lets a late cooperative return finish without blocking. If
+	// the operation never returns, its goroutine lives only until that imminent process exit.
+	done := make(chan error, 1)
+	go func() {
+		done <- processor.Flush(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errFlushDeadline, ctx.Err())
+	}
 }
