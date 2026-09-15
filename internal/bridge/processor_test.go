@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,20 @@ type recordingSink struct {
 }
 
 func (s *recordingSink) Write(_ context.Context, ex observation.Execution) error {
+	s.written = append(s.written, ex)
+	return nil
+}
+
+type failOnceSink struct {
+	attempts int
+	written  []observation.Execution
+}
+
+func (s *failOnceSink) Write(_ context.Context, ex observation.Execution) error {
+	s.attempts++
+	if s.attempts == 1 {
+		return errors.New("disk unavailable")
+	}
 	s.written = append(s.written, ex)
 	return nil
 }
@@ -365,6 +380,34 @@ func TestFlushEmitsSingleSignalPartials(t *testing.T) {
 	}
 	if ex.Correlation != observation.Correlated || ex.OperationID != opA {
 		t.Errorf("correlation lost on a partial: %+v", ex)
+	}
+}
+
+func TestFlushRetainsAnExecutionUntilTheSinkPersistsIt(t *testing.T) {
+	sink := &failOnceSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err == nil || !strings.Contains(err.Error(), "sink: disk unavailable") {
+		t.Fatalf("first flush error = %v, want wrapped sink failure", err)
+	}
+	if stats := p.Stats(); stats.Emitted != 0 || stats.EmittedLogOnly != 0 || stats.Correlated != 0 || stats.SinkWriteFailures != 1 || stats.StillBuffered != 1 {
+		t.Fatalf("stats after failed persistence = %+v", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.Stats(); stats.Emitted != 1 || stats.EmittedLogOnly != 1 || stats.Correlated != 1 || stats.SinkWriteFailures != 1 || stats.StillBuffered != 0 {
+		t.Fatalf("stats after retry = %+v", stats)
+	}
+	if sink.attempts != 2 || len(sink.written) != 1 {
+		t.Fatalf("sink attempts/writes = %d/%d, want 2/1", sink.attempts, len(sink.written))
 	}
 }
 

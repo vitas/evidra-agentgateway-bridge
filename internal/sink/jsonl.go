@@ -44,7 +44,10 @@ func NewJSONL(path string) (*JSONL, error) {
 	return &JSONL{path: path, f: f, w: bufio.NewWriter(f)}, nil
 }
 
-func (s *JSONL) Write(_ context.Context, ex observation.Execution) error {
+func (s *JSONL) Write(ctx context.Context, ex observation.Execution) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("write execution: %w", err)
+	}
 	raw, err := json.Marshal(ex)
 	if err != nil {
 		return fmt.Errorf("marshal execution: %w", err)
@@ -56,7 +59,10 @@ func (s *JSONL) Write(_ context.Context, ex observation.Execution) error {
 	}
 	// Flush per record. A receiver that buffers and is killed loses the tail, and the tail is
 	// exactly the part a run that ended badly needs.
-	return s.w.Flush()
+	if err := s.w.Flush(); err != nil {
+		return fmt.Errorf("write execution: %w", err)
+	}
+	return nil
 }
 
 // Close flushes and closes the underlying file.
@@ -94,5 +100,8 @@ func ReadAll(path string) ([]observation.Execution, error) {
 		}
 		out = append(out, ex)
 	}
-	return out, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan sink %s: %w", path, err)
+	}
+	return out, nil
 }
