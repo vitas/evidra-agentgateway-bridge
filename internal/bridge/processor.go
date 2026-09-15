@@ -281,8 +281,8 @@ func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 		// the claim existed; assembling once over all buffered signals removes the ordering
 		// question entirely.
 		if childKey, claimed := childOf[key]; claimed && childKey != key {
-			// The child claims this signal when the child itself is assembled. Until that
-			// record is durably written, leave every contributing signal buffered.
+			// The child claims this signal when the child itself is assembled. Until the sink
+			// successfully accepts that record, leave every contributing signal buffered.
 			continue
 		}
 
