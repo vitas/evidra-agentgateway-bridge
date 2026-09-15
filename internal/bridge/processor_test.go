@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,53 @@ type recordingSink struct {
 }
 
 func (s *recordingSink) Write(_ context.Context, ex observation.Execution) error {
+	s.written = append(s.written, ex)
+	return nil
+}
+
+type failOnceSink struct {
+	attempts int
+	written  []observation.Execution
+}
+
+type blockingSink struct {
+	started chan struct{}
+	release chan struct{}
+	written []observation.Execution
+}
+
+func (s *blockingSink) Write(_ context.Context, ex observation.Execution) error {
+	if len(s.written) == 0 {
+		close(s.started)
+		<-s.release
+	}
+	s.written = append(s.written, ex)
+	return nil
+}
+
+type blockingFailOnceSink struct {
+	started  chan struct{}
+	release  chan struct{}
+	attempts int
+	written  []observation.Execution
+}
+
+func (s *blockingFailOnceSink) Write(_ context.Context, ex observation.Execution) error {
+	s.attempts++
+	if s.attempts == 1 {
+		close(s.started)
+		<-s.release
+		return errors.New("injected sink failure")
+	}
+	s.written = append(s.written, ex)
+	return nil
+}
+
+func (s *failOnceSink) Write(_ context.Context, ex observation.Execution) error {
+	s.attempts++
+	if s.attempts == 1 {
+		return errors.New("disk unavailable")
+	}
 	s.written = append(s.written, ex)
 	return nil
 }
@@ -365,6 +413,191 @@ func TestFlushEmitsSingleSignalPartials(t *testing.T) {
 	}
 	if ex.Correlation != observation.Correlated || ex.OperationID != opA {
 		t.Errorf("correlation lost on a partial: %+v", ex)
+	}
+}
+
+func TestFlushRetainsAnExecutionUntilTheSinkPersistsIt(t *testing.T) {
+	sink := &failOnceSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err == nil || !strings.Contains(err.Error(), "sink: disk unavailable") {
+		t.Fatalf("first flush error = %v, want wrapped sink failure", err)
+	}
+	if stats := p.Stats(); stats.Emitted != 0 || stats.EmittedLogOnly != 0 || stats.Correlated != 0 || stats.SinkWriteFailures != 1 || stats.StillBuffered != 1 {
+		t.Fatalf("stats after failed persistence = %+v", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.Stats(); stats.Emitted != 1 || stats.EmittedLogOnly != 1 || stats.Correlated != 1 || stats.SinkWriteFailures != 1 || stats.StillBuffered != 0 {
+		t.Fatalf("stats after retry = %+v", stats)
+	}
+	if sink.attempts != 2 || len(sink.written) != 1 {
+		t.Fatalf("sink attempts/writes = %d/%d, want 2/1", sink.attempts, len(sink.written))
+	}
+}
+
+func TestFailedFlushMergesAConcurrentComplementBeforeRetry(t *testing.T) {
+	sink := &blockingFailOnceSink{started: make(chan struct{}), release: make(chan struct{})}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- p.Flush(ctx) }()
+	<-sink.started
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.Stats(); stats.StillBuffered != 1 || stats.LateSignalsIgnored != 0 {
+		t.Fatalf("stats while one join key has active and pending signals = %+v", stats)
+	}
+	close(sink.release)
+	if err := <-flushed; err == nil || !strings.Contains(err.Error(), "injected sink failure") {
+		t.Fatalf("first flush error = %v", err)
+	}
+	if stats := p.Stats(); stats.Emitted != 0 || stats.StillBuffered != 1 || stats.LateSignalsIgnored != 0 {
+		t.Fatalf("stats after failed generation = %+v", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 1 {
+		t.Fatalf("persisted %d records, want one merged retry", len(sink.written))
+	}
+	ex := sink.written[0]
+	if ex.OperationID != opA || ex.Correlation != observation.Correlated || strings.Join(ex.SeenFrom, ",") != "logs,traces" {
+		t.Fatalf("retried execution did not merge its complementary signal: %+v", ex)
+	}
+	if stats := p.Stats(); stats.Emitted != 1 || stats.EmittedMerged != 1 || stats.StillBuffered != 0 {
+		t.Fatalf("final stats = %+v", stats)
+	}
+}
+
+func TestFailedBatchMergesPendingSignalsForUnattemptedKeys(t *testing.T) {
+	sink := &blockingFailOnceSink{started: make(chan struct{}), release: make(chan struct{})}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET),
+		gatewaySpan(t, traceB, spanB, "apply_yaml", "beta", "", tracev1.Status_STATUS_CODE_UNSET),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- p.Flush(ctx) }()
+	<-sink.started
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceB, spanB, "apply_yaml", "beta", opB),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(sink.release)
+	if err := <-flushed; err == nil {
+		t.Fatal("first batch flush succeeded")
+	}
+	if stats := p.Stats(); stats.Emitted != 0 || stats.StillBuffered != 2 {
+		t.Fatalf("stats after failed batch = %+v", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 2 {
+		t.Fatalf("persisted %d records on retry, want one per join key", len(sink.written))
+	}
+	byTrace := map[string]observation.Execution{}
+	for _, ex := range sink.written {
+		byTrace[ex.TraceID] = ex
+	}
+	if ex := byTrace[traceB]; ex.OperationID != opB || strings.Join(ex.SeenFrom, ",") != "logs,traces" {
+		t.Fatalf("unattempted key lost its pending complement: %+v", ex)
+	}
+	if stats := p.Stats(); stats.Emitted != 2 || stats.EmittedMerged != 1 || stats.StillBuffered != 0 || stats.LateSignalsIgnored != 0 {
+		t.Fatalf("final stats after retried batch = %+v", stats)
+	}
+}
+
+func TestSuccessfulFlushFinalizesTheJoinKeyAndCountsConcurrentLateSignals(t *testing.T) {
+	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- p.Flush(ctx) }()
+	<-sink.started
+	// This is a legitimate complementary signal for the same execution. The snapshot already
+	// being persisted defines finalization, so the late signal must be counted and dropped.
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{
+		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET),
+		gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(sink.release)
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.Stats(); stats.Emitted != 1 || stats.StillBuffered != 0 || stats.LateSignalsIgnored != 3 {
+		t.Fatalf("stats after finalization = %+v", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 1 {
+		t.Fatalf("persisted %d records for one join key, want 1", len(sink.written))
+	}
+}
+
+func TestSignalAfterFinalizationIsIgnoredAndCountedOnce(t *testing.T) {
+	sink := &recordingSink{}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+	span := gatewaySpan(t, traceA, spanA, "restart", "alpha", "", tracev1.Status_STATUS_CODE_UNSET)
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{span}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ConsumeSpans(ctx, []*tracev1.Span{span}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 1 {
+		t.Fatalf("persisted %d records for one join key, want 1", len(sink.written))
+	}
+	stats := p.Stats()
+	if stats.SpansSeen != 2 || stats.LateSignalsIgnored != 1 || stats.StillBuffered != 0 {
+		t.Fatalf("stats after post-finalization signal = %+v", stats)
 	}
 }
 

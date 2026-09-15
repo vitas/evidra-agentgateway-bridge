@@ -1,5 +1,7 @@
 package normalize
 
+import "strings"
+
 // This file is the only place in the bridge that knows a non-standard attribute name.
 //
 // AgentGateway emits some attributes that are not in the OTel GenAI/MCP semantic
@@ -88,12 +90,14 @@ func operationID(attrs map[string]string) []string {
 	var found []string
 	seen := map[string]bool{}
 	for _, key := range OperationIDKeys {
-		v := attrs[key]
-		if v == "" || seen[v] {
-			continue
+		for _, v := range strings.Split(attrs[key], ",") {
+			v = strings.TrimSpace(v)
+			if v == "" || seen[v] {
+				continue
+			}
+			seen[v] = true
+			found = append(found, v)
 		}
-		seen[v] = true
-		found = append(found, v)
 	}
 	return found
 }

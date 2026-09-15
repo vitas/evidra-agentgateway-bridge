@@ -36,3 +36,4 @@ go.work.sum
 
 # Built binary; it was committed once in the sibling repository and took a history rewrite to undo.
 /bridge
+/bin/

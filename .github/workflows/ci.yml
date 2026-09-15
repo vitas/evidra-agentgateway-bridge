@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "The following files are not gofmt-formatted:" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: make vet
+
+      - name: Unit tests
+        run: make test
+
+      - name: Race detector
+        run: go test -race ./... -count=1
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.10.1
+          args: --timeout=5m
+          verify: false
+
+      - name: Verify repository lint target
+        run: make lint
+
+      - name: Build commands
+        run: |
+          make build
+          go build -o bin/evidra-agentgateway-replay ./cmd/replay
+
+      - name: Check host version command
+        run: ./bin/evidra-agentgateway --version
+
+      - name: Check repository contract
+        run: bash tests/test_repo_contract.sh
+
+      - name: Build container
+        run: docker build -t evidra-agentgateway:ci .
+
+      - name: Check container version command
+        run: docker run --rm evidra-agentgateway:ci --version

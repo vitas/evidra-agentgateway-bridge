@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -17,17 +19,66 @@ import (
 	"github.com/vitas/evidra-agentgateway-bridge/internal/otlpgrpc"
 	"github.com/vitas/evidra-agentgateway-bridge/internal/otlphttp"
 	"github.com/vitas/evidra-agentgateway-bridge/internal/sink"
+	"github.com/vitas/evidra-agentgateway-bridge/internal/version"
 )
 
+const shutdownTimeout = 10 * time.Second
+
+var errFlushDeadline = errors.New("flush did not complete before the shutdown deadline; buffered records are not confirmed durable")
+
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+type grpcShutdowner interface {
+	GracefulStop()
+	Stop()
+}
+
+type processorFlusher interface {
+	Flush(context.Context) error
+}
+
+type shutdownResult struct {
+	httpErr       error
+	flushErr      error
+	closeErr      error
+	grpcForced    bool
+	flushTimedOut bool
+}
+
+// exitCode treats every incomplete drain as a failed process shutdown. A forced gRPC stop is
+// bounded and intentional, but it interrupts active RPCs, so it cannot truthfully report success.
+func (r shutdownResult) exitCode() int {
+	if r.httpErr != nil || r.flushErr != nil || r.closeErr != nil || r.grpcForced {
+		return 1
+	}
+	return 0
+}
+
+func finalizeShutdown(result shutdownResult, closeOutput func() error) shutdownResult {
+	if !result.flushTimedOut {
+		result.closeErr = closeOutput()
+	}
+	return result
+}
+
 func main() {
+	os.Exit(run(os.Args[1:], os.Stdout))
+}
+
+func run(args []string, stdout io.Writer) int {
+	if len(args) == 1 && args[0] == "--version" {
+		_, _ = fmt.Fprintf(stdout, "evidra-agentgateway %s\n", version.Version)
+		return 0
+	}
+
 	cfg := config.LoadConfig()
 
 	out, err := sink.NewJSONL(cfg.ObservationsPath)
 	if err != nil {
 		log.Fatalf("observations sink: %v", err)
 	}
-	defer out.Close()
-
 	processor := bridge.NewProcessor(out, cfg.MergeWait)
 	processor.SetObserver(cfg.ObserverID, cfg.ObserverVersion)
 	log.Printf("normalizing OTLP logs and traces into %s (merge wait %s)", cfg.ObservationsPath, cfg.MergeWait)
@@ -75,17 +126,86 @@ func main() {
 	<-stop
 	log.Print("shutting down")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// HTTP drain, gRPC drain, and the final processor flush share one budget. A busy
+	// earlier phase therefore cannot silently turn each later phase into another 10-second wait.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-	grpcSrv.GracefulStop()
-
-	// Flush before exiting. Records seen on only one signal are still pending, and a receiver
-	// that drops them on shutdown reports a coverage gap that was actually a lifecycle bug.
-	if err := processor.Flush(context.Background()); err != nil {
-		log.Printf("flush: %v", err)
+	result := shutdownServices(shutdownCtx, server, grpcSrv, processor)
+	// A timed-out regular-file write cannot be canceled safely. In that one case, skip Close and
+	// return failure so main can terminate the process without racing the in-flight write.
+	result = finalizeShutdown(result, out.Close)
+	if result.httpErr != nil {
+		log.Printf("HTTP shutdown: %v", result.httpErr)
+	}
+	if result.grpcForced {
+		log.Print("gRPC graceful shutdown exceeded the shutdown budget; forced stop")
+	}
+	if result.flushErr != nil {
+		log.Printf("flush: %v", result.flushErr)
+	}
+	if result.closeErr != nil {
+		log.Printf("close observations sink: %v", result.closeErr)
 	}
 	stats := processor.Stats()
 	raw, _ := json.Marshal(stats)
-	log.Printf("final stats: %s", raw)
+	if result.flushTimedOut {
+		log.Printf("stats at shutdown deadline (persistence not confirmed): %s", raw)
+	} else {
+		log.Printf("final stats: %s", raw)
+	}
+
+	return result.exitCode()
+}
+
+func shutdownServices(
+	ctx context.Context,
+	httpServer httpShutdowner,
+	grpcServer grpcShutdowner,
+	processor processorFlusher,
+) shutdownResult {
+	result := shutdownResult{httpErr: httpServer.Shutdown(ctx)}
+	result.grpcForced = stopGRPC(ctx, grpcServer)
+	result.flushErr = flushProcessor(ctx, processor)
+	result.flushTimedOut = errors.Is(result.flushErr, errFlushDeadline)
+	return result
+}
+
+func stopGRPC(ctx context.Context, server grpcShutdowner) bool {
+	done := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return false
+	case <-ctx.Done():
+		// grpc.Server.Stop interrupts active RPCs and makes GracefulStop return.
+		server.Stop()
+		<-done
+		return true
+	}
+}
+
+func flushProcessor(ctx context.Context, processor processorFlusher) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", errFlushDeadline, err)
+	}
+
+	// Regular-file writes cannot be forcibly interrupted by canceling a context. Bound the
+	// caller anyway: in the CLI/PID1 lifecycle main immediately os.Exit's after run returns.
+	// The buffered result channel lets a late cooperative return finish without blocking. If
+	// the operation never returns, its goroutine lives only until that imminent process exit.
+	done := make(chan error, 1)
+	go func() {
+		done <- processor.Flush(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", errFlushDeadline, ctx.Err())
+	}
 }

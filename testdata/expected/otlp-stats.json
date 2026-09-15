@@ -1,0 +1,17 @@
+{
+  "log_records_seen": 6,
+  "spans_seen": 12,
+  "non_tool_call_ignored": 6,
+  "emitted": 4,
+  "emitted_merged": 4,
+  "emitted_log_only": 0,
+  "emitted_span_only": 0,
+  "sink_write_failures": 0,
+  "late_signals_ignored": 0,
+  "unjoinable_missing_span_id": 0,
+  "parent_spans_suppressed": 4,
+  "correlated": 2,
+  "unattributed": 1,
+  "ambiguous": 1,
+  "still_buffered": 0
+}

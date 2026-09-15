@@ -37,14 +37,16 @@ type Sink interface {
 // Stats counts what the assembly actually did. It exists because a receiver that silently drops
 // or silently half-assembles looks identical from outside to one that works.
 type Stats struct {
-	LogRecordsSeen   int `json:"log_records_seen"`
-	SpansSeen        int `json:"spans_seen"`
-	ToolCallsIgnored int `json:"non_tool_call_ignored"`
-	Emitted          int `json:"emitted"`
-	EmittedMerged    int `json:"emitted_merged"`
-	EmittedLogOnly   int `json:"emitted_log_only"`
-	EmittedSpanOnly  int `json:"emitted_span_only"`
-	UnjoinableNoSpan int `json:"unjoinable_missing_span_id"`
+	LogRecordsSeen     int `json:"log_records_seen"`
+	SpansSeen          int `json:"spans_seen"`
+	ToolCallsIgnored   int `json:"non_tool_call_ignored"`
+	Emitted            int `json:"emitted"`
+	EmittedMerged      int `json:"emitted_merged"`
+	EmittedLogOnly     int `json:"emitted_log_only"`
+	EmittedSpanOnly    int `json:"emitted_span_only"`
+	SinkWriteFailures  int `json:"sink_write_failures"`
+	LateSignalsIgnored int `json:"late_signals_ignored"`
+	UnjoinableNoSpan   int `json:"unjoinable_missing_span_id"`
 	// ParentsSuppressed counts spans not emitted because a client span in the same trace claimed
 	// them as parent. One tools/call is two spans; without this the receiver reports twice the
 	// executions that happened, which reads as coverage rather than as duplication.
@@ -61,14 +63,29 @@ type Processor struct {
 	maxWait time.Duration
 	now     func() time.Time
 
-	mu              sync.Mutex
-	observerID      string
-	observerVersion string
-	spans           map[string]observation.Execution
-	logs            map[string]observation.Execution
-	firstSeen       map[string]time.Time
-	emitted         map[string]bool
-	stats           Stats
+	assembleMu       sync.Mutex
+	mu               sync.Mutex
+	observerID       string
+	observerVersion  string
+	spans            map[string]observation.Execution
+	logs             map[string]observation.Execution
+	firstSeen        map[string]time.Time
+	pendingSpans     map[string]observation.Execution
+	pendingLogs      map[string]observation.Execution
+	pendingFirstSeen map[string]time.Time
+	pendingSignals   map[string]int
+	inFlight         map[string]bool
+	emitted          map[string]bool
+	stats            Stats
+}
+
+type assembledExecution struct {
+	key               string
+	consumedKeys      []string
+	ex                observation.Execution
+	both              bool
+	loggy             bool
+	parentsSuppressed int
 }
 
 // NewProcessor returns a processor that emits to sink. maxWait is how long a signal is held
@@ -76,13 +93,18 @@ type Processor struct {
 // Flush, which is what makes the tests deterministic.
 func NewProcessor(sink Sink, maxWait time.Duration) *Processor {
 	return &Processor{
-		sink:      sink,
-		maxWait:   maxWait,
-		now:       time.Now,
-		spans:     map[string]observation.Execution{},
-		logs:      map[string]observation.Execution{},
-		firstSeen: map[string]time.Time{},
-		emitted:   map[string]bool{},
+		sink:             sink,
+		maxWait:          maxWait,
+		now:              time.Now,
+		spans:            map[string]observation.Execution{},
+		logs:             map[string]observation.Execution{},
+		firstSeen:        map[string]time.Time{},
+		pendingSpans:     map[string]observation.Execution{},
+		pendingLogs:      map[string]observation.Execution{},
+		pendingFirstSeen: map[string]time.Time{},
+		pendingSignals:   map[string]int{},
+		inFlight:         map[string]bool{},
+		emitted:          map[string]bool{},
 	}
 }
 
@@ -139,6 +161,11 @@ func (p *Processor) Stats() Stats {
 	defer p.mu.Unlock()
 	s := p.stats
 	s.StillBuffered = len(p.firstSeen)
+	for key := range p.pendingFirstSeen {
+		if _, active := p.firstSeen[key]; !active {
+			s.StillBuffered++
+		}
+	}
 	return s
 }
 
@@ -160,23 +187,39 @@ func (p *Processor) buffer(ex observation.Execution, signal string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.emitted[key] {
+		// This is a normalized tool-call signal, but its execution key is already durable.
+		// Count it as late rather than as a non-tool call, and never reopen the key.
+		p.stats.LateSignalsIgnored++
 		return
 	}
 	if p.observerID != "" {
 		ex.Source.ObserverID = p.observerID
 		ex.Source.ObserverVersion = p.observerVersion
 	}
-	dst := p.spans
+	spans, logs, firstSeen := p.spans, p.logs, p.firstSeen
+	usePending := p.inFlight[key] || p.hasPending(key)
+	if usePending {
+		spans, logs, firstSeen = p.pendingSpans, p.pendingLogs, p.pendingFirstSeen
+	}
+	dst := spans
 	if signal == normalize.SignalLogs {
-		dst = p.logs
+		dst = logs
 	}
 	if prev, ok := dst[key]; ok {
 		ex = merge(prev, ex)
 	}
 	dst[key] = ex
-	if _, ok := p.firstSeen[key]; !ok {
-		p.firstSeen[key] = p.now()
+	if _, ok := firstSeen[key]; !ok {
+		firstSeen[key] = p.now()
 	}
+	if usePending {
+		p.pendingSignals[key]++
+	}
+}
+
+func (p *Processor) hasPending(key string) bool {
+	_, ok := p.pendingFirstSeen[key]
+	return ok
 }
 
 func (p *Processor) assembleExpired(ctx context.Context) error {
@@ -204,6 +247,13 @@ func (p *Processor) assembleExpired(ctx context.Context) error {
 // tool+target+time instead would be exactly the heuristic the correlation contract forbids; the
 // parent link is trace structure the source asserted.
 func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
+	// Only one assembly may claim buffered records at a time. The processor mutex is still
+	// released before sink I/O, so ingestion and Stats remain responsive while persistence is
+	// in progress; serializing assemblers prevents two concurrent Flush calls from writing the
+	// same retained snapshot.
+	p.assembleMu.Lock()
+	defer p.assembleMu.Unlock()
+
 	p.mu.Lock()
 	ready := p.readyKeys(cutoff)
 	if len(ready) == 0 {
@@ -221,19 +271,9 @@ func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 		}
 	}
 
-	type assembled struct {
-		key   string
-		ex    observation.Execution
-		both  bool
-		loggy bool
-	}
-	var out []assembled
-	consumed := map[string]bool{}
+	var out []assembledExecution
 
 	for _, key := range ready {
-		if consumed[key] {
-			continue
-		}
 		// A span or log keyed by a parent span id that a client span claims is not an
 		// execution of its own. The access log carries the server span's id, so it lands
 		// under the parent's key; the execution is the client span, and the log's data
@@ -241,63 +281,98 @@ func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 		// the claim existed; assembling once over all buffered signals removes the ordering
 		// question entirely.
 		if childKey, claimed := childOf[key]; claimed && childKey != key {
-			consumed[key] = true
-			if _, hasSpan := p.spans[key]; hasSpan {
-				p.stats.ParentsSuppressed++
-			}
-			if logRec, ok := p.logs[key]; ok {
-				if child, ok := p.spans[childKey]; ok {
-					p.spans[childKey] = merge(child, logRec)
-				}
-				delete(p.logs, key)
-			}
+			// The child claims this signal when the child itself is assembled. Until the sink
+			// successfully accepts that record, leave every contributing signal buffered.
 			continue
 		}
 
-		span, hasSpan := p.spans[key]
-		logRec, hasLog := p.logs[key]
-		if !hasSpan && !hasLog {
-			consumed[key] = true
-			continue
+		if a, ok := p.assembleKey(key); ok {
+			out = append(out, a)
 		}
-
-		ex := logRec
-		if hasSpan {
-			ex = span
-			// A client span takes its correlation from its parent, which is where the
-			// projected operation id lands.
-			if span.SpanKind == normalize.SpanKindClient && span.ParentSpanID != "" {
-				parentKey := span.TraceID + "/" + span.ParentSpanID
-				if parent, ok := p.spans[parentKey]; ok {
-					ex = merge(ex, parent)
-				}
-				if parentLog, ok := p.logs[parentKey]; ok {
-					ex = merge(ex, parentLog)
-				}
-				consumed[parentKey] = true
-			}
-			if hasLog {
-				ex = merge(ex, logRec)
-			}
-		}
-		consumed[key] = true
-		out = append(out, assembled{key: key, ex: ex, both: hasSpan && hasLog, loggy: !hasSpan})
 	}
-
-	for key := range consumed {
-		delete(p.spans, key)
-		delete(p.logs, key)
-		delete(p.firstSeen, key)
+	for _, a := range out {
+		for _, key := range a.consumedKeys {
+			p.inFlight[key] = true
+		}
 	}
 	p.mu.Unlock()
 
 	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
-	for _, a := range out {
-		if err := p.emit(ctx, a.key, a.ex, a.both || len(a.ex.SeenFrom) > 1, a.loggy); err != nil {
+	for i, a := range out {
+		if err := p.emit(ctx, a); err != nil {
+			p.restoreReserved(out[i:])
 			return err
 		}
 	}
 	return nil
+}
+
+// restoreReserved rolls every failed or unattempted snapshot back into active assembly. Signals
+// received during sink I/O live in pending maps; folding them back here makes the retry observe
+// one merged generation per JoinKey.
+func (p *Processor) restoreReserved(records []assembledExecution) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	restored := map[string]bool{}
+	for _, a := range records {
+		for _, key := range a.consumedKeys {
+			if restored[key] {
+				continue
+			}
+			restored[key] = true
+			p.mergePendingIntoActive(key)
+			delete(p.inFlight, key)
+		}
+	}
+}
+
+// assembleKey snapshots one execution while p.mu is held. It does not mutate buffered state;
+// the caller acknowledges every contributing key only after persistence succeeds.
+func (p *Processor) assembleKey(key string) (assembledExecution, bool) {
+	span, hasSpan := p.spans[key]
+	logRec, hasLog := p.logs[key]
+	if !hasSpan && !hasLog {
+		return assembledExecution{}, false
+	}
+	if !hasSpan {
+		return assembledExecution{
+			key:          key,
+			consumedKeys: []string{key},
+			ex:           logRec,
+			loggy:        true,
+		}, true
+	}
+
+	a := assembledExecution{
+		key:          key,
+		consumedKeys: []string{key},
+		ex:           span,
+		both:         hasLog,
+	}
+	// A client span takes its correlation from its parent, which is where the projected
+	// operation id lands.
+	if span.SpanKind == normalize.SpanKindClient && span.ParentSpanID != "" {
+		p.mergeParent(&a, span.TraceID+"/"+span.ParentSpanID)
+	}
+	if hasLog {
+		a.ex = merge(a.ex, logRec)
+	}
+	return a, true
+}
+
+func (p *Processor) mergeParent(a *assembledExecution, parentKey string) {
+	parent, hasParentSpan := p.spans[parentKey]
+	parentLog, hasParentLog := p.logs[parentKey]
+	if hasParentSpan {
+		a.ex = merge(a.ex, parent)
+		a.parentsSuppressed = 1
+	}
+	if hasParentLog {
+		a.ex = merge(a.ex, parentLog)
+	}
+	if hasParentSpan || hasParentLog {
+		a.consumedKeys = append(a.consumedKeys, parentKey)
+	}
 }
 
 // readyKeys returns buffered keys whose wait has elapsed, in a stable order.
@@ -312,14 +387,38 @@ func (p *Processor) readyKeys(cutoff time.Time) []string {
 	return keys
 }
 
-func (p *Processor) emit(ctx context.Context, key string, ex observation.Execution, merged, logOnly bool) error {
+func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 	p.mu.Lock()
-	if p.emitted[key] {
+	if p.emitted[a.key] {
 		p.mu.Unlock()
 		return nil
 	}
-	p.emitted[key] = true
-	switch ex.Correlation {
+	sink := p.sink
+	p.mu.Unlock()
+
+	if sink != nil {
+		if err := sink.Write(ctx, a.ex); err != nil {
+			p.mu.Lock()
+			p.stats.SinkWriteFailures++
+			p.mu.Unlock()
+			return fmt.Errorf("sink: %w", err)
+		}
+	}
+
+	// Persistence succeeded. Only now may the buffered inputs be acknowledged and the
+	// success counters advance.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, key := range a.consumedKeys {
+		delete(p.spans, key)
+		delete(p.logs, key)
+		delete(p.firstSeen, key)
+		delete(p.inFlight, key)
+		p.stats.LateSignalsIgnored += p.discardPending(key)
+		p.emitted[key] = true
+	}
+	p.stats.ParentsSuppressed += a.parentsSuppressed
+	switch a.ex.Correlation {
 	case observation.Correlated:
 		p.stats.Correlated++
 	case observation.Ambiguous:
@@ -329,23 +428,56 @@ func (p *Processor) emit(ctx context.Context, key string, ex observation.Executi
 	}
 	p.stats.Emitted++
 	switch {
-	case merged:
+	case a.both || len(a.ex.SeenFrom) > 1:
 		p.stats.EmittedMerged++
-	case logOnly:
+	case a.loggy:
 		p.stats.EmittedLogOnly++
 	default:
 		p.stats.EmittedSpanOnly++
 	}
-	sink := p.sink
-	p.mu.Unlock()
-
-	if sink == nil {
-		return nil
-	}
-	if err := sink.Write(ctx, ex); err != nil {
-		return fmt.Errorf("sink: %w", err)
-	}
 	return nil
+}
+
+// mergePendingIntoActive restores signals received during a failed in-flight write. It is called
+// with p.mu held and preserves the original first-seen time when the active generation exists.
+func (p *Processor) mergePendingIntoActive(key string) {
+	seen, ok := p.pendingFirstSeen[key]
+	if !ok {
+		return
+	}
+	if ex, exists := p.pendingSpans[key]; exists {
+		if active, activeExists := p.spans[key]; activeExists {
+			p.spans[key] = merge(active, ex)
+		} else {
+			p.spans[key] = ex
+		}
+		delete(p.pendingSpans, key)
+	}
+	if ex, exists := p.pendingLogs[key]; exists {
+		if active, activeExists := p.logs[key]; activeExists {
+			p.logs[key] = merge(active, ex)
+		} else {
+			p.logs[key] = ex
+		}
+		delete(p.pendingLogs, key)
+	}
+	if _, active := p.firstSeen[key]; !active {
+		p.firstSeen[key] = seen
+	}
+	delete(p.pendingFirstSeen, key)
+	delete(p.pendingSignals, key)
+}
+
+// discardPending drops signals that arrived after a snapshot began persistence. A successful
+// write finalizes every contributing JoinKey, so reopening one would create a second record for
+// the same execution. The return value is the number of actual signals dropped.
+func (p *Processor) discardPending(key string) int {
+	dropped := p.pendingSignals[key]
+	delete(p.pendingSpans, key)
+	delete(p.pendingLogs, key)
+	delete(p.pendingFirstSeen, key)
+	delete(p.pendingSignals, key)
+	return dropped
 }
 
 // merge combines two records of one execution. Field by field it prefers a value over an

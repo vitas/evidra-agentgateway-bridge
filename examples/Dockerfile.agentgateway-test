@@ -1,0 +1,21 @@
+# v1.5.0 release revision: fe6732474a96a0363dfb9822859af4e9bab360fa.
+# The official image uses /app/agentgateway as USER 65532 on shell-less
+# Chainguard glibc-dynamic. Keep that exact binary, but put it in a pinned Node
+# 22 Trixie runtime (glibc >= 2.39) so the stdio fixture is present at build
+# time. npm registry integrity for 2026.8.31:
+# sha512-5U3OZh8Xq0Li4nA26l6uNvV9/1suMDuWSn+NjLZIhzinhMY6N3A4DCrxVecBGPf2PsNFKTEv5krxGPRwzxc7jQ==
+FROM cr.agentgateway.dev/agentgateway:v1.5.0@sha256:bf2f339ef326d32def2aaeb44b1b4549801293c19b89e764a4228667d97d9896 AS agentgateway
+
+FROM docker.io/library/node:22.19.0-trixie-slim@sha256:a174cf99ada4707fb5a81a9233af04db83911c68b6bf58199f956fbdf8389926
+
+WORKDIR /app
+COPY examples/package.json examples/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && test "$(node -p "require('./node_modules/@modelcontextprotocol/server-everything/package.json').version")" = "2026.8.31"
+
+COPY --from=agentgateway /app/agentgateway /app/agentgateway
+
+ENV AGENTGATEWAY_ENV=container
+ENV PATH=/app/node_modules/.bin:$PATH
+USER 65532
+ENTRYPOINT ["/app/agentgateway"]

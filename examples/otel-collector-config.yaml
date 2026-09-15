@@ -6,15 +6,26 @@ receivers:
 
 processors:
   batch:
+    timeout: 1s
 
 exporters:
-  otlphttp/evidra_bridge:
-    endpoint: http://host.docker.internal:4318
+  otlp_http/evidra_bridge:
+    traces_endpoint: http://evidra-bridge:4318/v1/traces
+    logs_endpoint: http://evidra-bridge:4318/v1/logs
     compression: none
+    retry_on_failure:
+      enabled: true
+      initial_interval: 200ms
+      max_interval: 1s
+      max_elapsed_time: 5s
 
 service:
   pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/evidra_bridge]
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/evidra_bridge]
+      exporters: [otlp_http/evidra_bridge]

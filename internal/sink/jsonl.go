@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,17 +18,27 @@ import (
 	"github.com/vitas/evidra-agentgateway-bridge/internal/observation"
 )
 
-// JSONL appends one execution per line. It is append-only and never rewrites what it wrote,
-// because a record that changed after the fact is not evidence.
+type jsonlFile interface {
+	Write([]byte) (int, error)
+	Stat() (os.FileInfo, error)
+	Truncate(int64) error
+	Close() error
+}
+
+// JSONL appends one execution per line. It is append-only and never rewrites a successful
+// record, because a record that changed after the fact is not evidence. One JSONL instance owns
+// its path exclusively until Close; concurrent processes or separately opened JSONL instances
+// writing the same path are unsupported because transactional rollback uses the previous size.
 type JSONL struct {
-	mu   sync.Mutex
-	path string
-	f    *os.File
-	w    *bufio.Writer
+	mu       sync.Mutex
+	path     string
+	f        jsonlFile
+	poisoned error
 }
 
 // NewJSONL opens or creates the file at path. Directories are created, so a run can point at
-// a fresh output directory without a separate mkdir step.
+// a fresh output directory without a separate mkdir step. The caller must ensure no other writer
+// uses the same path until this sink is closed.
 func NewJSONL(path string) (*JSONL, error) {
 	if path == "" {
 		return nil, fmt.Errorf("sink path is required")
@@ -41,33 +52,57 @@ func NewJSONL(path string) (*JSONL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sink: %w", err)
 	}
-	return &JSONL{path: path, f: f, w: bufio.NewWriter(f)}, nil
+	return &JSONL{path: path, f: f}, nil
 }
 
-func (s *JSONL) Write(_ context.Context, ex observation.Execution) error {
+// Write appends a complete JSON line. Success means the operating system accepted every byte;
+// it does not promise fsync-level durability across a host crash. A failed or partial append is
+// truncated back to its starting size so the caller can retry without leaving a corrupt prefix.
+// If rollback fails, the sink becomes poisoned and rejects every later write in this process.
+func (s *JSONL) Write(ctx context.Context, ex observation.Execution) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("write execution: %w", err)
+	}
 	raw, err := json.Marshal(ex)
 	if err != nil {
 		return fmt.Errorf("marshal execution: %w", err)
 	}
+	line := append(raw, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.w.Write(append(raw, '\n')); err != nil {
+	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("write execution: %w", err)
 	}
-	// Flush per record. A receiver that buffers and is killed loses the tail, and the tail is
-	// exactly the part a run that ended badly needs.
-	return s.w.Flush()
+	if s.poisoned != nil {
+		return fmt.Errorf("sink is poisoned after an unrecoverable append: %w", s.poisoned)
+	}
+	info, err := s.f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat sink %s: %w", s.path, err)
+	}
+	start := info.Size()
+	n, writeErr := s.f.Write(line)
+	if writeErr == nil && n == len(line) {
+		return nil
+	}
+	if writeErr == nil {
+		writeErr = io.ErrShortWrite
+	}
+	if rollbackErr := s.f.Truncate(start); rollbackErr != nil {
+		s.poisoned = fmt.Errorf("write execution: %w; rollback to offset %d: %v", writeErr, start, rollbackErr)
+		return fmt.Errorf("sink is poisoned after an unrecoverable append: %w", s.poisoned)
+	}
+	return fmt.Errorf("write execution: %w (partial append rolled back to offset %d)", writeErr, start)
 }
 
-// Close flushes and closes the underlying file.
+// Close closes the underlying file. Write has no userspace buffer to flush.
 func (s *JSONL) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.w.Flush(); err != nil {
-		_ = s.f.Close()
-		return err
+	if err := s.f.Close(); err != nil {
+		return fmt.Errorf("close sink %s: %w", s.path, err)
 	}
-	return s.f.Close()
+	return nil
 }
 
 // ReadAll parses a JSONL artifact back into executions. It exists so tests and parity runs
@@ -94,5 +129,8 @@ func ReadAll(path string) ([]observation.Execution, error) {
 		}
 		out = append(out, ex)
 	}
-	return out, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("scan sink %s: %w", path, err)
+	}
+	return out, nil
 }
