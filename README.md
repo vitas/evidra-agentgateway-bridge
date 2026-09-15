@@ -12,12 +12,13 @@ what the agent said, and it never decides whether what the agent said was true.
 Agent
   │  MCP, one endpoint
   ▼
-AgentGateway Virtual MCP ──── target: evidra (prescribe/report, agent-declared claims)
-  │                        └─ target: kubernetes / github / database (operational work)
+AgentGateway Virtual MCP ───── target: MCP server (operational work)
   │
-  │  OTLP: spans carry the execution facts, access logs carry the operation id
+  │  OTLP/gRPC: spans carry execution facts, access logs carry the operation id
   ▼
-this bridge ── normalize ── join ── correlate ──▶ observations
+OpenTelemetry Collector ── OTLP/HTTP fanout ──▶ this bridge
+                                                 │
+                                      normalize ─┴─ join ─▶ observations.jsonl
 ```
 
 ## What it does
@@ -90,12 +91,13 @@ operation id would land on whichever execution merged first.
 frontendPolicies:
   accessLog:
     add:
-      evidra_op: request.headers['baggage'].split(',').filter(x, x.startsWith('evidra.operation.id='))[0].split('=')[1]
+      evidra_op: request.headers['baggage'].split('evidra.operation.id=')[1].split(',')[0]
 ```
 
-Verified against AgentGateway v1.5.0 in the CORR-0 scaffold: the projected value arrives beside
-`mcp.target`, `gen_ai.tool.name` and `mcp.method.name` in one access-log record, two concurrent
-operations stay on their own records, and no backend MCP server is modified.
+Verified by the committed AgentGateway v1.5.0 parity run: the projected value reaches the access
+log, joins to the client span through the parent/server span relationship, and produces two
+`correlated` records for two distinct explicit operation ids. The upstream MCP server is not
+modified.
 
 The receiver reads the id from `evidra.operation.id`, then `evidra_op`, then
 `evidra_operation_id` (`normalize.OperationIDKeys`). A whole `baggage` header is deliberately
@@ -134,6 +136,29 @@ that forwarded nothing look like one that was merely unconfigured.
 go run ./cmd/bridge
 ```
 
+The reproducible AgentGateway parity run builds the local bridge and a test-only AgentGateway
+image, starts the committed topology, sends one successful and one failing MCP tool call, drains
+the telemetry pipeline, and checks the exact counters and privacy canaries:
+
+```bash
+docker compose -f examples/compose.yaml config
+./tests/e2e_otlp.sh
+```
+
+It pins AgentGateway v1.5.0, Node 22.19.0, the Everything MCP server at `2026.8.31`, and the
+OpenTelemetry Collector at `0.160.0`; the image digests are recorded in the compose file and test
+Dockerfile. No production credentials are used. A passing run reports:
+
+```text
+logs=4 spans=8 ignored=6 emitted=2 merged=2 correlated=2 unattributed=0
+```
+
+The failing MCP response is deliberately represented as a measured limitation: AgentGateway returns
+`isError: true`, but v1.5.0 exports neither an MCP error attribute nor an error span status for
+that call. The bridge therefore records its source-reported status as `success`; it does not
+invent an error from response content it is configured not to receive. This outcome-fidelity gap
+is a decision input for the integration checkpoint, not a passing accuracy claim.
+
 `GET /stats` is not a convenience. It is how a parity run distinguishes "the receiver saw
 nothing" from "the receiver saw it and could not join it" — without it those two look identical
 from outside, which is how the old correlation bug survived: the forwarder returned success and
@@ -146,8 +171,9 @@ go run ./cmd/replay     # replays testdata/agentgateway/ as one OTLP log export
 ## Status
 
 Done: OTLP receive (HTTP + gRPC, both signals), normalization against the semantic conventions
-with an alias table, exact join, three-state correlation, JSONL sink, stats, and tests covering
-the classification rules, the merge, the privacy refusal and the real gateway record shape.
+with an alias table, exact join, three-state correlation, JSONL sink, stats, and a reproducible
+AgentGateway v1.5.0 parity run covering the real logs-plus-traces path, explicit operation-id
+projection, merge counters and raw-payload exclusion.
 
 Not done, in order:
 

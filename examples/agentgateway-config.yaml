@@ -1,22 +1,32 @@
 config:
+  readinessAddr: 0.0.0.0:15021
+
+frontendPolicies:
   tracing:
-    otlpEndpoint: http://otel-collector:4317
+    host: otel-collector:4317
     randomSampling: true
+    remove:
+    - gen_ai.tool.call.arguments
+    - gen_ai.tool.call.result
+  accessLog:
+    # Project only the explicit Evidra operation member. The bridge deliberately
+    # does not parse or retain the complete baggage header.
+    add:
+      evidra_op: request.headers['baggage'].split('evidra.operation.id=')[1].split(',')[0]
+    remove:
+    - gen_ai.tool.call.arguments
+    - gen_ai.tool.call.result
+    otlp:
+      host: otel-collector:4317
+
 binds:
 - port: 3000
   listeners:
   - routes:
-    - policies:
-        cors:
-          allowOrigins:
-          - "*"
-          allowHeaders:
-          - "*"
-          exposeHeaders:
-          - "Mcp-Session-Id"
-      backends:
+    - backends:
       - mcp:
           targets:
           - name: everything
-            mcp:
-              host: http://host.docker.internal:3005/mcp/
+            stdio:
+              cmd: mcp-server-everything
+              args: ["stdio"]

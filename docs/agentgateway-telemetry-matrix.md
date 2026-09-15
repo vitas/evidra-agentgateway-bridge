@@ -1,32 +1,44 @@
 # AgentGateway Telemetry Matrix
 
-This bridge intentionally starts from generic telemetry that is reasonable to
-emit beyond Evidra-specific use cases.
+This matrix records the measured `examples/compose.yaml` path. It does not infer
+fields from documentation or from AgentGateway's stdout access log.
 
-## Available Today
+## Measured on AgentGateway v1.5.0
 
-- trace export over OTLP gRPC
-- export fanout through a standard OpenTelemetry Collector into OTLP/HTTP
-- request trace and span identifiers
-- MCP method name
-- tool name hints such as `gen_ai.tool.name`
-- resource name hints such as `mcp.resource.name`
-- target hints such as `mcp.target`
-- session hints such as `mcp.session_id`
-- response status hints such as `http.status_code`
+- AgentGateway exports traces and access logs directly to the Collector over
+  OTLP/gRPC.
+- The Collector fans both signals out to the bridge over the committed
+  `/v1/traces` and `/v1/logs` OTLP/HTTP routes.
+- Four MCP requests produce 4 log records and 8 spans. The bridge ignores the
+  six non-tool-call signals from initialize and initialized, suppresses the two
+  server/parent tool spans, and emits exactly 2 merged execution records.
+- Both tool executions carry trace id, span id, parent span id, MCP method,
+  `gen_ai.tool.name`, `mcp.target`, and the diagnostic MCP session id.
+- `frontendPolicies.accessLog.add.evidra_op` projects two explicit baggage
+  operation ids. Both reach their matching execution: `correlated=2`,
+  `unattributed=0`, `ambiguous=0`.
+- Raw arguments and results are explicitly removed from both telemetry
+  policies. Two request/result canaries are absent from JSONL, and both
+  fingerprint availability fields read `not_emitted_by_source`.
 
-## Available With Configuration
+## Measured gap
 
-- direct OTLP/HTTP log export if AgentGateway exposes a log pipeline in the deployment
-- authz decision metadata if AgentGateway is configured to emit generic
-  ext-authz attributes into OTEL
-- deployment-specific routing labels carried through standard telemetry config
+The test's unknown-tool call returns a valid MCP tool result with `isError:
+true` and error code `-32602` in its text. AgentGateway v1.5.0 exports no
+`mcp.error.*`, `error.type`, or error span status for that response. The bridge
+therefore emits both records with source-reported status `success`.
 
-## Likely Needs Upstream Or Fork Work
+Recovering that outcome from raw result content would violate the privacy
+configuration. Until AgentGateway exports a bounded terminal outcome attribute,
+this transport has execution and correlation parity but not outcome parity.
 
-- richer first-class MCP telemetry in OTEL config without custom CEL wiring
-- more explicit authz decision fields as documented standard attributes
-- cleaner MCP semantic examples in public AgentGateway docs
+## Not exercised by this parity run
+
+- direct AgentGateway-to-bridge OTLP/HTTP (the committed topology intentionally
+  measures Collector fanout)
+- authz decision metadata
+- resource and prompt telemetry, which the bridge intentionally ignores
+- raw tool arguments or results
 
 ## Guardrails
 
@@ -36,4 +48,16 @@ This bridge should not depend on:
 - raw tool results by default
 - Evidra-specific hashes, canonization artifacts, or scoring inputs
 
-If richer telemetry is added later, it should remain generic and broadly useful.
+If richer telemetry is added later, terminal outcome should be a bounded,
+generic attribute rather than raw result content.
+
+## Reproduce
+
+```bash
+docker compose -f examples/compose.yaml config
+./tests/e2e_otlp.sh
+```
+
+The expected full counter object is committed at
+`testdata/expected/otlp-stats.json`; any signal-count, merge, correlation, or
+buffering drift fails the run.
