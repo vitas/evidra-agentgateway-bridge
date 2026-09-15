@@ -31,6 +31,9 @@
       "outcome_authoritative": false
     }
   ],
+  "cancellation_notification_sent": true,
+  "cancellation_terminal_hook": false,
+  "criterion_unmet": "v1.5.0 cancellation notification did not produce CheckResponse; no terminal fallback",
   "response_hook_gaps": [
     "CheckResponse is only called when AgentGateway receives an MCP response; disconnects are start-only.",
     "The ExtMCP request/response API does not expose a terminal outcome field; outcome_authority=false."

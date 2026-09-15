@@ -17,13 +17,21 @@ The live run is `tests/e2e_extmcp.sh`; its machine-readable output is
 | --- | --- | --- | --- | --- |
 | success echo | observed | observed | authoritative | pass-through request and response |
 | tool_error | observed | observed | authoritative | gateway returned an MCP error result and still invoked the response hook |
-| cancelled slow_then_cancel | observed | not observed | authoritative | killing the gateway during a long upstream call leaves start-only capture |
+| cancelled slow_then_cancel | observed | not observed | authoritative | v1.5.0 `notifications/cancelled` was sent while the call was active, but no terminal response hook arrived |
 | missing_response disconnect | observed | not observed | authoritative | gateway killed during a distinct long-running call; no response hook |
 
 The server retains only service names, method, request/response hook presence,
 and the bounded operation context. `mcp_request` and `mcp_response` are never
-copied, hashed, logged, or persisted. The hook API has no terminal outcome
-field; `outcome_authoritative` is therefore false for every row.
+copied, hashed, logged, or persisted; the live run also asserts that the
+machine-readable capture has no raw-payload fields or canary bytes. The hook
+API has no terminal outcome field; `outcome_authoritative` is therefore false
+for every row.
+
+The cancellation notification is a measured limitation, not a simulated
+success: the live client sent `notifications/cancelled` for request id `4`,
+kept AgentGateway alive, and waited for the call. AgentGateway v1.5.0 did not
+produce `CheckResponse` before the bounded wait. The machine result records
+`cancellation_terminal_hook: false` and marks the plan criterion unmet.
 
 ## OTLP comparison
 
@@ -53,7 +61,10 @@ The decision rule is:
 - if none qualifies, stop at unattributed experimental observations.
 
 ExtMCP satisfies the operation-context condition, but this spike does not
-provide a fallback that can turn a start-only disconnect into a terminal fact.
+provide a fallback that can turn a start-only disconnect or cancellation into a
+terminal fact. The live cancellation notification also failed to produce a
+terminal response hook, so the approved `wantFinish: true` cancellation
+criterion is unmet on v1.5.0.
 OTLP has exact pairing and explicit projected identity in the measured client
 path, but it has the measured outcome-fidelity gap and does not cover
 disconnects. A hybrid would add no exact deduplication key across the two paths
@@ -70,3 +81,13 @@ the primary capture path.
 - [AgentGateway v1.5.0 release](https://github.com/agentgateway/agentgateway/releases/tag/v1.5.0)
 - [Pinned `ext_mcp.proto`](https://github.com/agentgateway/agentgateway/blob/fe6732474a96a0363dfb9822859af4e9bab360fa/crates/protos/proto/ext_mcp.proto)
 - [ExtMCP guardrail configuration](https://docs.solo.io/agentgateway/standalone/latest/documentation/mcp/guardrails/about/)
+
+## Generated binding provenance
+
+`internal/extmcp/api/ext_mcp.pb.go` and `ext_mcp_grpc.pb.go` are copied from
+the upstream API submodule at the pinned commit above. They are deliberately
+limited to `ext_mcp.proto`, rather than importing the full upstream API module
+(whose package also compiles unrelated resource bindings). To regenerate,
+replace these two files with the generated files from that exact upstream
+submodule revision and run `gofmt`, then run `make verify` and
+`tests/e2e_extmcp.sh`.
