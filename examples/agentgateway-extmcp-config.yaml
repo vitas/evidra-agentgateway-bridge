@@ -1,0 +1,27 @@
+# AgentGateway v1.5.0 ExtMCP capture-path spike.
+# The operation id is projected by the gateway into metadata_context; the
+# policy server never guesses it from timing, tool names, traces, or payloads.
+config:
+  readinessAddr: 0.0.0.0:15021
+
+binds:
+- port: 3000
+  listeners:
+  - routes:
+    - policies:
+        mcpGuardrails:
+          processors:
+          - kind: remote
+            host: host.docker.internal:19090
+            failureMode: failOpen
+            metadata:
+              evidra_operation_id: request.headers['x-evidra-operation-id']
+            methods:
+              tools/call: full
+      backends:
+      - mcp:
+          targets:
+          - name: everything
+            stdio:
+              cmd: mcp-server-everything
+              args: ["stdio"]
