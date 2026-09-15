@@ -37,15 +37,16 @@ type Sink interface {
 // Stats counts what the assembly actually did. It exists because a receiver that silently drops
 // or silently half-assembles looks identical from outside to one that works.
 type Stats struct {
-	LogRecordsSeen    int `json:"log_records_seen"`
-	SpansSeen         int `json:"spans_seen"`
-	ToolCallsIgnored  int `json:"non_tool_call_ignored"`
-	Emitted           int `json:"emitted"`
-	EmittedMerged     int `json:"emitted_merged"`
-	EmittedLogOnly    int `json:"emitted_log_only"`
-	EmittedSpanOnly   int `json:"emitted_span_only"`
-	SinkWriteFailures int `json:"sink_write_failures"`
-	UnjoinableNoSpan  int `json:"unjoinable_missing_span_id"`
+	LogRecordsSeen     int `json:"log_records_seen"`
+	SpansSeen          int `json:"spans_seen"`
+	ToolCallsIgnored   int `json:"non_tool_call_ignored"`
+	Emitted            int `json:"emitted"`
+	EmittedMerged      int `json:"emitted_merged"`
+	EmittedLogOnly     int `json:"emitted_log_only"`
+	EmittedSpanOnly    int `json:"emitted_span_only"`
+	SinkWriteFailures  int `json:"sink_write_failures"`
+	LateSignalsIgnored int `json:"late_signals_ignored"`
+	UnjoinableNoSpan   int `json:"unjoinable_missing_span_id"`
 	// ParentsSuppressed counts spans not emitted because a client span in the same trace claimed
 	// them as parent. One tools/call is two spans; without this the receiver reports twice the
 	// executions that happened, which reads as coverage rather than as duplication.
@@ -72,6 +73,7 @@ type Processor struct {
 	pendingSpans     map[string]observation.Execution
 	pendingLogs      map[string]observation.Execution
 	pendingFirstSeen map[string]time.Time
+	pendingSignals   map[string]int
 	inFlight         map[string]bool
 	emitted          map[string]bool
 	stats            Stats
@@ -100,6 +102,7 @@ func NewProcessor(sink Sink, maxWait time.Duration) *Processor {
 		pendingSpans:     map[string]observation.Execution{},
 		pendingLogs:      map[string]observation.Execution{},
 		pendingFirstSeen: map[string]time.Time{},
+		pendingSignals:   map[string]int{},
 		inFlight:         map[string]bool{},
 		emitted:          map[string]bool{},
 	}
@@ -157,7 +160,12 @@ func (p *Processor) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := p.stats
-	s.StillBuffered = len(p.firstSeen) + len(p.pendingFirstSeen)
+	s.StillBuffered = len(p.firstSeen)
+	for key := range p.pendingFirstSeen {
+		if _, active := p.firstSeen[key]; !active {
+			s.StillBuffered++
+		}
+	}
 	return s
 }
 
@@ -179,6 +187,9 @@ func (p *Processor) buffer(ex observation.Execution, signal string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.emitted[key] {
+		// This is a normalized tool-call signal, but its execution key is already durable.
+		// Count it as late rather than as a non-tool call, and never reopen the key.
+		p.stats.LateSignalsIgnored++
 		return
 	}
 	if p.observerID != "" {
@@ -186,7 +197,8 @@ func (p *Processor) buffer(ex observation.Execution, signal string) {
 		ex.Source.ObserverVersion = p.observerVersion
 	}
 	spans, logs, firstSeen := p.spans, p.logs, p.firstSeen
-	if p.inFlight[key] || p.hasPending(key) {
+	usePending := p.inFlight[key] || p.hasPending(key)
+	if usePending {
 		spans, logs, firstSeen = p.pendingSpans, p.pendingLogs, p.pendingFirstSeen
 	}
 	dst := spans
@@ -199,6 +211,9 @@ func (p *Processor) buffer(ex observation.Execution, signal string) {
 	dst[key] = ex
 	if _, ok := firstSeen[key]; !ok {
 		firstSeen[key] = p.now()
+	}
+	if usePending {
+		p.pendingSignals[key]++
 	}
 }
 
@@ -285,18 +300,27 @@ func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
 	for i, a := range out {
 		if err := p.emit(ctx, a); err != nil {
-			p.releaseInFlight(out[i+1:])
+			p.restoreReserved(out[i:])
 			return err
 		}
 	}
 	return nil
 }
 
-func (p *Processor) releaseInFlight(records []assembledExecution) {
+// restoreReserved rolls every failed or unattempted snapshot back into active assembly. Signals
+// received during sink I/O live in pending maps; folding them back here makes the retry observe
+// one merged generation per JoinKey.
+func (p *Processor) restoreReserved(records []assembledExecution) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	restored := map[string]bool{}
 	for _, a := range records {
 		for _, key := range a.consumedKeys {
+			if restored[key] {
+				continue
+			}
+			restored[key] = true
+			p.mergePendingIntoActive(key)
 			delete(p.inFlight, key)
 		}
 	}
@@ -376,9 +400,6 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 		if err := sink.Write(ctx, a.ex); err != nil {
 			p.mu.Lock()
 			p.stats.SinkWriteFailures++
-			for _, key := range a.consumedKeys {
-				delete(p.inFlight, key)
-			}
 			p.mu.Unlock()
 			return fmt.Errorf("sink: %w", err)
 		}
@@ -393,11 +414,8 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 		delete(p.logs, key)
 		delete(p.firstSeen, key)
 		delete(p.inFlight, key)
-		if p.promotePending(key) {
-			delete(p.emitted, key)
-		} else {
-			p.emitted[key] = true
-		}
+		p.stats.LateSignalsIgnored += p.discardPending(key)
+		p.emitted[key] = true
 	}
 	p.stats.ParentsSuppressed += a.parentsSuppressed
 	switch a.ex.Correlation {
@@ -420,24 +438,46 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 	return nil
 }
 
-// promotePending advances only observations that arrived after the persisted snapshot was
-// materialized. Keeping that generation separate prevents acknowledgement of A from deleting B.
-func (p *Processor) promotePending(key string) bool {
+// mergePendingIntoActive restores signals received during a failed in-flight write. It is called
+// with p.mu held and preserves the original first-seen time when the active generation exists.
+func (p *Processor) mergePendingIntoActive(key string) {
 	seen, ok := p.pendingFirstSeen[key]
 	if !ok {
-		return false
+		return
 	}
 	if ex, exists := p.pendingSpans[key]; exists {
-		p.spans[key] = ex
+		if active, activeExists := p.spans[key]; activeExists {
+			p.spans[key] = merge(active, ex)
+		} else {
+			p.spans[key] = ex
+		}
 		delete(p.pendingSpans, key)
 	}
 	if ex, exists := p.pendingLogs[key]; exists {
-		p.logs[key] = ex
+		if active, activeExists := p.logs[key]; activeExists {
+			p.logs[key] = merge(active, ex)
+		} else {
+			p.logs[key] = ex
+		}
 		delete(p.pendingLogs, key)
 	}
-	p.firstSeen[key] = seen
+	if _, active := p.firstSeen[key]; !active {
+		p.firstSeen[key] = seen
+	}
 	delete(p.pendingFirstSeen, key)
-	return true
+	delete(p.pendingSignals, key)
+}
+
+// discardPending drops signals that arrived after a snapshot began persistence. A successful
+// write finalizes every contributing JoinKey, so reopening one would create a second record for
+// the same execution. The return value is the number of actual signals dropped.
+func (p *Processor) discardPending(key string) int {
+	dropped := p.pendingSignals[key]
+	delete(p.pendingSpans, key)
+	delete(p.pendingLogs, key)
+	delete(p.pendingFirstSeen, key)
+	delete(p.pendingSignals, key)
+	return dropped
 }
 
 // merge combines two records of one execution. Field by field it prefers a value over an
