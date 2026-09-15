@@ -12,7 +12,7 @@ fields from documentation or from AgentGateway's stdout access log.
 - Six MCP requests produce 6 log records and 12 spans. The bridge ignores the
   six non-tool-call signals from initialize and initialized, suppresses the
   four server/parent tool spans, and emits exactly 4 merged execution records.
-- Both tool executions carry trace id, span id, parent span id, MCP method,
+- Each tool execution carries trace id, span id, parent span id, MCP method,
   `gen_ai.tool.name`, `mcp.target`, and the diagnostic MCP session id.
 - `frontendPolicies.accessLog.add.evidra_op` projects exact comma-delimited
   baggage members. Two valid ids correlate, an unrelated substring remains
