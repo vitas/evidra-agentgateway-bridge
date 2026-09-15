@@ -91,7 +91,7 @@ operation id would land on whichever execution merged first.
 frontendPolicies:
   accessLog:
     add:
-      evidra_op: request.headers['baggage'].split('evidra.operation.id=')[1].split(',')[0]
+      evidra_op: request.headers['baggage'].split(',').filter(member, member.split('=')[0] == 'evidra.operation.id').map(member, member.split('=')[1]).join(',')
 ```
 
 Verified by the committed AgentGateway v1.5.0 parity run: the projected value reaches the access
@@ -141,7 +141,7 @@ image, starts the committed topology, sends one successful and one failing MCP t
 the telemetry pipeline, and checks the exact counters and privacy canaries:
 
 ```bash
-docker compose -f examples/compose.yaml config
+EVIDRA_E2E_OUTPUT_DIR=/tmp/evidra-compose-config docker compose -f examples/compose.yaml config
 ./tests/e2e_otlp.sh
 ```
 
@@ -150,7 +150,7 @@ OpenTelemetry Collector at `0.160.0`; the image digests are recorded in the comp
 Dockerfile. No production credentials are used. A passing run reports:
 
 ```text
-logs=4 spans=8 ignored=6 emitted=2 merged=2 correlated=2 unattributed=0
+logs=6 spans=12 ignored=6 emitted=4 merged=4 correlated=2 unattributed=1 ambiguous=1
 ```
 
 The failing MCP response is deliberately represented as a measured limitation: AgentGateway returns

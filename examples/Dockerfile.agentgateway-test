@@ -8,12 +8,14 @@ FROM cr.agentgateway.dev/agentgateway:v1.5.0@sha256:bf2f339ef326d32def2aaeb44b1b
 
 FROM docker.io/library/node:22.19.0-trixie-slim@sha256:a174cf99ada4707fb5a81a9233af04db83911c68b6bf58199f956fbdf8389926
 
-RUN npm install --global --omit=dev --no-audit --no-fund \
-      @modelcontextprotocol/server-everything@2026.8.31 \
-    && test "$(node -p "require('/usr/local/lib/node_modules/@modelcontextprotocol/server-everything/package.json').version")" = "2026.8.31"
+WORKDIR /app
+COPY examples/package.json examples/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && test "$(node -p "require('./node_modules/@modelcontextprotocol/server-everything/package.json').version")" = "2026.8.31"
 
 COPY --from=agentgateway /app/agentgateway /app/agentgateway
 
 ENV AGENTGATEWAY_ENV=container
+ENV PATH=/app/node_modules/.bin:$PATH
 USER 65532
 ENTRYPOINT ["/app/agentgateway"]

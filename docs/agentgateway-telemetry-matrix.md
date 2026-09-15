@@ -9,14 +9,15 @@ fields from documentation or from AgentGateway's stdout access log.
   OTLP/gRPC.
 - The Collector fans both signals out to the bridge over the committed
   `/v1/traces` and `/v1/logs` OTLP/HTTP routes.
-- Four MCP requests produce 4 log records and 8 spans. The bridge ignores the
-  six non-tool-call signals from initialize and initialized, suppresses the two
-  server/parent tool spans, and emits exactly 2 merged execution records.
+- Six MCP requests produce 6 log records and 12 spans. The bridge ignores the
+  six non-tool-call signals from initialize and initialized, suppresses the
+  four server/parent tool spans, and emits exactly 4 merged execution records.
 - Both tool executions carry trace id, span id, parent span id, MCP method,
   `gen_ai.tool.name`, `mcp.target`, and the diagnostic MCP session id.
-- `frontendPolicies.accessLog.add.evidra_op` projects two explicit baggage
-  operation ids. Both reach their matching execution: `correlated=2`,
-  `unattributed=0`, `ambiguous=0`.
+- `frontendPolicies.accessLog.add.evidra_op` projects exact comma-delimited
+  baggage members. Two valid ids correlate, an unrelated substring remains
+  unattributed, and conflicting exact ids remain ambiguous: `correlated=2`,
+  `unattributed=1`, `ambiguous=1`.
 - Raw arguments and results are explicitly removed from both telemetry
   policies. Two request/result canaries are absent from JSONL, and both
   fingerprint availability fields read `not_emitted_by_source`.
@@ -54,7 +55,7 @@ generic attribute rather than raw result content.
 ## Reproduce
 
 ```bash
-docker compose -f examples/compose.yaml config
+EVIDRA_E2E_OUTPUT_DIR=/tmp/evidra-compose-config docker compose -f examples/compose.yaml config
 ./tests/e2e_otlp.sh
 ```
 

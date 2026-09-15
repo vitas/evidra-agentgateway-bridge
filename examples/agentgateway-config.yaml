@@ -12,7 +12,7 @@ frontendPolicies:
     # Project only the explicit Evidra operation member. The bridge deliberately
     # does not parse or retain the complete baggage header.
     add:
-      evidra_op: request.headers['baggage'].split('evidra.operation.id=')[1].split(',')[0]
+      evidra_op: request.headers['baggage'].split(',').filter(member, member.split('=')[0] == 'evidra.operation.id').map(member, member.split('=')[1]).join(',')
     remove:
     - gen_ai.tool.call.arguments
     - gen_ai.tool.call.result

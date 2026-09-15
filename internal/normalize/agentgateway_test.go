@@ -104,6 +104,37 @@ func TestFromLogRecordReadsTheRealGatewayAccessLog(t *testing.T) {
 	}
 }
 
+func TestOperationProjectionPreservesExactBaggageMembers(t *testing.T) {
+	cases := []struct {
+		name   string
+		value  string
+		want   observation.Correlation
+		wantID string
+	}{
+		{name: "unrelated substring is not an operation member", value: "note=evidra.operation.id=" + realOperationID, want: observation.Ambiguous},
+		{name: "conflicting exact members stay ambiguous", value: realOperationID + ",EV-01M2FAS00J36FTV4EG5EJC1D8", want: observation.Ambiguous},
+		{name: "one exact member correlates", value: realOperationID, want: observation.Correlated, wantID: realOperationID},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := gatewayAccessLogFields(realOperationID)
+			for i, field := range fields {
+				if field.Key == "evidra_op" {
+					fields[i] = str("evidra_op", tc.value)
+				}
+			}
+			record := &logsv1.LogRecord{Attributes: fields, TraceId: id(t, testTraceID), SpanId: id(t, testSpanID)}
+			ex, ok := FromLogRecord(record)
+			if !ok {
+				t.Fatal("access-log record was not normalized")
+			}
+			if ex.Correlation != tc.want || ex.OperationID != tc.wantID {
+				t.Fatalf("correlation = %s/%q, want %s/%q", ex.Correlation, ex.OperationID, tc.want, tc.wantID)
+			}
+		})
+	}
+}
+
 func TestFromLogRecordIgnoresNonToolCalls(t *testing.T) {
 	for _, method := range []string{"initialize", "tools/list", "resources/read", "prompts/get", ""} {
 		fields := gatewayAccessLogFields(realOperationID)

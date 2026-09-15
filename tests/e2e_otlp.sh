@@ -6,7 +6,16 @@ compose_file="$repo_root/examples/compose.yaml"
 expected="$repo_root/testdata/expected/otlp-stats.json"
 project="evidra-otlp-$(date +%s)-$$"
 output_dir=$(mktemp -d "${TMPDIR:-/tmp}/evidra-otlp.XXXXXX")
-export EVIDRA_E2E_OUTPUT_DIR="$output_dir"
+chmod 700 "$output_dir"
+data_dir="$output_dir/data"
+mkdir "$data_dir"
+chmod 777 "$data_dir"
+stat_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+test "$(stat_mode "$output_dir")" = 700
+test "$(stat_mode "$data_dir")" = 777
+export EVIDRA_E2E_OUTPUT_DIR="$data_dir"
 export DOCKER_CLIENT_TIMEOUT=120
 export COMPOSE_HTTP_TIMEOUT=120
 
@@ -17,23 +26,43 @@ compose() {
 extract_mcp_json() {
   input=$1
   output=$2
-  sed -n 's/^data: //p' "$input" | tail -n 1 >"$output"
+  awk '
+    /^data:/ {
+      line = $0
+      sub(/^data:[[:space:]]?/, "", line)
+      event = event line "\n"
+      next
+    }
+    /^$/ {
+      if (event != "") { last = event; event = "" }
+    }
+    END {
+      if (event != "") last = event
+      printf "%s", last
+    }
+  ' "$input" >"$output"
   jq -e . "$output" >/dev/null
 }
 
 cleanup() {
   rc=$?
+  trap - EXIT INT TERM
   if (( rc != 0 )); then
     compose logs --no-color >"$output_dir/compose.log" 2>&1 || true
     echo "E2E failed; observations and compose logs retained in $output_dir" >&2
   fi
-  compose down --volumes --remove-orphans --timeout 10 >/dev/null 2>&1 || true
+  compose down --volumes --remove-orphans --rmi local --timeout 10 >/dev/null 2>&1 || true
   if (( rc == 0 )); then
     rm -rf "$output_dir"
   fi
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+  exit "$1"
+}
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+trap cleanup EXIT
 
 for command in curl docker jq; do
   command -v "$command" >/dev/null || {
@@ -103,12 +132,40 @@ extract_mcp_json "$output_dir/failure.json" "$output_dir/failure.payload.json"
 jq -e '.result.isError == true and (.result.content[0].text | contains("-32602"))' \
   "$output_dir/failure.payload.json" >/dev/null
 
+curl --fail --silent --show-error --max-time 10 \
+  --header 'Accept: application/json, text/event-stream' \
+  --header 'Content-Type: application/json' \
+  --header 'MCP-Protocol-Version: 2025-06-18' \
+  --header "Mcp-Session-Id: $session_id" \
+  --header 'Baggage: note=evidra.operation.id=EV-01M2FAS00J36FTV4EG5EJC1D7' \
+  --data '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"message":"unrelated"}}}' \
+  "$gateway_url" >"$output_dir/unrelated.json"
+extract_mcp_json "$output_dir/unrelated.json" "$output_dir/unrelated.payload.json"
+jq -e '.result.content | length > 0' "$output_dir/unrelated.payload.json" >/dev/null
+
+conflict_a=EV-01M2FAS00J36FTV4EG5EJC1D7
+conflict_b=EV-01M2FAS00J36FTV4EG5EJC1D8
+curl --fail --silent --show-error --max-time 10 \
+  --header 'Accept: application/json, text/event-stream' \
+  --header 'Content-Type: application/json' \
+  --header 'MCP-Protocol-Version: 2025-06-18' \
+  --header "Mcp-Session-Id: $session_id" \
+  --header "Baggage: evidra.operation.id=$conflict_a,evidra.operation.id=$conflict_b" \
+  --data '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{"message":"conflicting"}}}' \
+  "$gateway_url" >"$output_dir/conflict.json"
+extract_mcp_json "$output_dir/conflict.json" "$output_dir/conflict.payload.json"
+jq -e '.result.content | length > 0' "$output_dir/conflict.payload.json" >/dev/null
+
 # AgentGateway's OTLP SDK processors export on a batch schedule. Do not send
 # SIGTERM before that bounded schedule has delivered both signals; v1.5.0 can
 # otherwise spend its shutdown budget waiting on processors it has just stopped.
 telemetry_ready=false
+live_stats='{}'
 for _ in $(seq 1 30); do
-  live_stats=$(curl --fail --silent --show-error --max-time 2 "$bridge_url/stats")
+  if ! live_stats=$(curl --fail --silent --show-error --max-time 2 "$bridge_url/stats"); then
+    sleep 0.5
+    continue
+  fi
   if jq -e '.log_records_seen >= 4 and .spans_seen > 0' <<<"$live_stats" >/dev/null; then
     telemetry_ready=true
     break
@@ -137,16 +194,18 @@ if ! diff -u <(jq -S . "$expected") <(jq -S . <<<"$actual_stats"); then
   exit 1
 fi
 
-observations="$output_dir/observations.jsonl"
+observations="$EVIDRA_E2E_OUTPUT_DIR/observations.jsonl"
 test -s "$observations"
 test "$(wc -l <"$observations" | tr -d ' ')" = "$(jq -r '.emitted' "$expected")"
 jq -e -s '
-  length == 2 and
+  length == 4 and
   all(.[]; .status == "success") and
   (map(select(.tool == "definitely_missing_tool")) | length == 1) and
   all(.[]; .seen_from == ["logs", "traces"]) and
-  all(.[]; .correlation == "correlated") and
-  ([.[].operation_id] | sort) == [
+  (map(select(.correlation == "correlated")) | length == 2) and
+  (map(select(.correlation == "unattributed")) | length == 1) and
+  (map(select(.correlation == "ambiguous")) | length == 1) and
+  ([map(select(.correlation == "correlated"))[].operation_id] | sort) == [
     "EV-01ARZ3NDEKTSV4RRFFQ69G5FAV",
     "EV-01ARZ3NDEKTSV4RRFFQ69G5FAW"
   ] and
@@ -160,5 +219,5 @@ if grep -Fq "$canary_args" "$observations" || grep -Fq "$canary_result" "$observ
 fi
 
 echo "AgentGateway OTLP parity passed: $actual_stats"
-echo 'Correlation: 2 correlated, 0 unattributed; privacy canaries absent.'
+echo 'Correlation: 2 correlated, 1 unattributed, 1 ambiguous; privacy canaries absent.'
 echo 'Outcome gap: the MCP failure response was isError=true, but v1.5.0 telemetry classified both spans as successful.'
