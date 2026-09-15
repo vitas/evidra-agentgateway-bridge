@@ -37,6 +37,21 @@ type failOnceSink struct {
 	written  []observation.Execution
 }
 
+type blockingSink struct {
+	started chan struct{}
+	release chan struct{}
+	written []observation.Execution
+}
+
+func (s *blockingSink) Write(_ context.Context, ex observation.Execution) error {
+	if len(s.written) == 0 {
+		close(s.started)
+		<-s.release
+	}
+	s.written = append(s.written, ex)
+	return nil
+}
+
 func (s *failOnceSink) Write(_ context.Context, ex observation.Execution) error {
 	s.attempts++
 	if s.attempts == 1 {
@@ -408,6 +423,51 @@ func TestFlushRetainsAnExecutionUntilTheSinkPersistsIt(t *testing.T) {
 	}
 	if sink.attempts != 2 || len(sink.written) != 1 {
 		t.Fatalf("sink attempts/writes = %d/%d, want 2/1", sink.attempts, len(sink.written))
+	}
+}
+
+func TestFlushAcknowledgesOnlyTheGenerationItPersisted(t *testing.T) {
+	sink := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
+	p := NewProcessor(sink, 0)
+	ctx := context.Background()
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "restart", "alpha", opA),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- p.Flush(ctx) }()
+	<-sink.started
+	// The same join key is reused deliberately: this signal arrived after generation A was
+	// materialized for the sink and must not be folded into, or deleted with, that snapshot.
+	if err := p.ConsumeLogRecords(ctx, []*logsv1.LogRecord{
+		gatewayLog(t, traceA, spanA, "apply_yaml", "beta", opB),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(sink.release)
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.Stats(); stats.Emitted != 1 || stats.StillBuffered != 1 {
+		t.Fatalf("stats after generation A = %+v, want A emitted and B buffered", stats)
+	}
+
+	if err := p.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.written) != 2 {
+		t.Fatalf("persisted %d generations, want 2", len(sink.written))
+	}
+	if sink.written[0].OperationID != opA || sink.written[0].Tool != "restart" {
+		t.Fatalf("generation A = %+v", sink.written[0])
+	}
+	if sink.written[1].OperationID != opB || sink.written[1].Tool != "apply_yaml" {
+		t.Fatalf("generation B = %+v", sink.written[1])
+	}
+	if stats := p.Stats(); stats.Emitted != 2 || stats.StillBuffered != 0 {
+		t.Fatalf("final stats = %+v", stats)
 	}
 }
 

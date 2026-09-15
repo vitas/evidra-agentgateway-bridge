@@ -62,15 +62,19 @@ type Processor struct {
 	maxWait time.Duration
 	now     func() time.Time
 
-	assembleMu      sync.Mutex
-	mu              sync.Mutex
-	observerID      string
-	observerVersion string
-	spans           map[string]observation.Execution
-	logs            map[string]observation.Execution
-	firstSeen       map[string]time.Time
-	emitted         map[string]bool
-	stats           Stats
+	assembleMu       sync.Mutex
+	mu               sync.Mutex
+	observerID       string
+	observerVersion  string
+	spans            map[string]observation.Execution
+	logs             map[string]observation.Execution
+	firstSeen        map[string]time.Time
+	pendingSpans     map[string]observation.Execution
+	pendingLogs      map[string]observation.Execution
+	pendingFirstSeen map[string]time.Time
+	inFlight         map[string]bool
+	emitted          map[string]bool
+	stats            Stats
 }
 
 type assembledExecution struct {
@@ -87,13 +91,17 @@ type assembledExecution struct {
 // Flush, which is what makes the tests deterministic.
 func NewProcessor(sink Sink, maxWait time.Duration) *Processor {
 	return &Processor{
-		sink:      sink,
-		maxWait:   maxWait,
-		now:       time.Now,
-		spans:     map[string]observation.Execution{},
-		logs:      map[string]observation.Execution{},
-		firstSeen: map[string]time.Time{},
-		emitted:   map[string]bool{},
+		sink:             sink,
+		maxWait:          maxWait,
+		now:              time.Now,
+		spans:            map[string]observation.Execution{},
+		logs:             map[string]observation.Execution{},
+		firstSeen:        map[string]time.Time{},
+		pendingSpans:     map[string]observation.Execution{},
+		pendingLogs:      map[string]observation.Execution{},
+		pendingFirstSeen: map[string]time.Time{},
+		inFlight:         map[string]bool{},
+		emitted:          map[string]bool{},
 	}
 }
 
@@ -149,7 +157,7 @@ func (p *Processor) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := p.stats
-	s.StillBuffered = len(p.firstSeen)
+	s.StillBuffered = len(p.firstSeen) + len(p.pendingFirstSeen)
 	return s
 }
 
@@ -177,17 +185,26 @@ func (p *Processor) buffer(ex observation.Execution, signal string) {
 		ex.Source.ObserverID = p.observerID
 		ex.Source.ObserverVersion = p.observerVersion
 	}
-	dst := p.spans
+	spans, logs, firstSeen := p.spans, p.logs, p.firstSeen
+	if p.inFlight[key] || p.hasPending(key) {
+		spans, logs, firstSeen = p.pendingSpans, p.pendingLogs, p.pendingFirstSeen
+	}
+	dst := spans
 	if signal == normalize.SignalLogs {
-		dst = p.logs
+		dst = logs
 	}
 	if prev, ok := dst[key]; ok {
 		ex = merge(prev, ex)
 	}
 	dst[key] = ex
-	if _, ok := p.firstSeen[key]; !ok {
-		p.firstSeen[key] = p.now()
+	if _, ok := firstSeen[key]; !ok {
+		firstSeen[key] = p.now()
 	}
+}
+
+func (p *Processor) hasPending(key string) bool {
+	_, ok := p.pendingFirstSeen[key]
+	return ok
 }
 
 func (p *Processor) assembleExpired(ctx context.Context) error {
@@ -258,15 +275,31 @@ func (p *Processor) assemble(ctx context.Context, cutoff time.Time) error {
 			out = append(out, a)
 		}
 	}
+	for _, a := range out {
+		for _, key := range a.consumedKeys {
+			p.inFlight[key] = true
+		}
+	}
 	p.mu.Unlock()
 
 	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
-	for _, a := range out {
+	for i, a := range out {
 		if err := p.emit(ctx, a); err != nil {
+			p.releaseInFlight(out[i+1:])
 			return err
 		}
 	}
 	return nil
+}
+
+func (p *Processor) releaseInFlight(records []assembledExecution) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range records {
+		for _, key := range a.consumedKeys {
+			delete(p.inFlight, key)
+		}
+	}
 }
 
 // assembleKey snapshots one execution while p.mu is held. It does not mutate buffered state;
@@ -341,7 +374,12 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 
 	if sink != nil {
 		if err := sink.Write(ctx, a.ex); err != nil {
-			p.count(func(s *Stats) { s.SinkWriteFailures++ })
+			p.mu.Lock()
+			p.stats.SinkWriteFailures++
+			for _, key := range a.consumedKeys {
+				delete(p.inFlight, key)
+			}
+			p.mu.Unlock()
 			return fmt.Errorf("sink: %w", err)
 		}
 	}
@@ -354,7 +392,12 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 		delete(p.spans, key)
 		delete(p.logs, key)
 		delete(p.firstSeen, key)
-		p.emitted[key] = true
+		delete(p.inFlight, key)
+		if p.promotePending(key) {
+			delete(p.emitted, key)
+		} else {
+			p.emitted[key] = true
+		}
 	}
 	p.stats.ParentsSuppressed += a.parentsSuppressed
 	switch a.ex.Correlation {
@@ -375,6 +418,26 @@ func (p *Processor) emit(ctx context.Context, a assembledExecution) error {
 		p.stats.EmittedSpanOnly++
 	}
 	return nil
+}
+
+// promotePending advances only observations that arrived after the persisted snapshot was
+// materialized. Keeping that generation separate prevents acknowledgement of A from deleting B.
+func (p *Processor) promotePending(key string) bool {
+	seen, ok := p.pendingFirstSeen[key]
+	if !ok {
+		return false
+	}
+	if ex, exists := p.pendingSpans[key]; exists {
+		p.spans[key] = ex
+		delete(p.pendingSpans, key)
+	}
+	if ex, exists := p.pendingLogs[key]; exists {
+		p.logs[key] = ex
+		delete(p.pendingLogs, key)
+	}
+	p.firstSeen[key] = seen
+	delete(p.pendingFirstSeen, key)
+	return true
 }
 
 // merge combines two records of one execution. Field by field it prefers a value over an
