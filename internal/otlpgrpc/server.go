@@ -85,6 +85,12 @@ func (s *Server) GracefulStop() {
 	s.grpcServer.GracefulStop()
 }
 
+// Stop immediately terminates active RPCs. Shutdown uses it only when the shared graceful
+// shutdown deadline has expired.
+func (s *Server) Stop() {
+	s.grpcServer.Stop()
+}
+
 func flattenSpans(req *coltracev1.ExportTraceServiceRequest) []*tracev1.Span {
 	var spans []*tracev1.Span
 	for _, resourceSpans := range req.ResourceSpans {

@@ -22,6 +22,29 @@ import (
 	"github.com/vitas/evidra-agentgateway-bridge/internal/version"
 )
 
+const shutdownTimeout = 10 * time.Second
+
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+type grpcShutdowner interface {
+	GracefulStop()
+	Stop()
+}
+
+// processorFlusher follows the usual context contract: it must stop work and return when ctx
+// is canceled. Keeping Flush synchronous guarantees no writer survives run's return.
+type processorFlusher interface {
+	Flush(context.Context) error
+}
+
+type shutdownResult struct {
+	httpErr    error
+	flushErr   error
+	grpcForced bool
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout))
 }
@@ -91,19 +114,60 @@ func run(args []string, stdout io.Writer) int {
 	<-stop
 	log.Print("shutting down")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// HTTP drain, gRPC drain, and the final processor flush share one budget. A busy
+	// earlier phase therefore cannot silently turn each later phase into another 10-second wait.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-	grpcSrv.GracefulStop()
-
-	// Flush before exiting. Records seen on only one signal are still pending, and a receiver
-	// that drops them on shutdown reports a coverage gap that was actually a lifecycle bug.
-	if err := processor.Flush(context.Background()); err != nil {
-		log.Printf("flush: %v", err)
+	result := shutdownServices(shutdownCtx, server, grpcSrv, processor)
+	if result.httpErr != nil {
+		log.Printf("HTTP shutdown: %v", result.httpErr)
+	}
+	if result.grpcForced {
+		log.Print("gRPC graceful shutdown exceeded the shutdown budget; forced stop")
+	}
+	if result.flushErr != nil {
+		log.Printf("flush: %v", result.flushErr)
 	}
 	stats := processor.Stats()
 	raw, _ := json.Marshal(stats)
 	log.Printf("final stats: %s", raw)
 
 	return 0
+}
+
+func shutdownServices(
+	ctx context.Context,
+	httpServer httpShutdowner,
+	grpcServer grpcShutdowner,
+	processor processorFlusher,
+) shutdownResult {
+	result := shutdownResult{httpErr: httpServer.Shutdown(ctx)}
+	result.grpcForced = stopGRPC(ctx, grpcServer)
+	result.flushErr = flushProcessor(ctx, processor)
+	return result
+}
+
+func stopGRPC(ctx context.Context, server grpcShutdowner) bool {
+	done := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return false
+	case <-ctx.Done():
+		// grpc.Server.Stop interrupts active RPCs and makes GracefulStop return.
+		server.Stop()
+		<-done
+		return true
+	}
+}
+
+func flushProcessor(ctx context.Context, processor processorFlusher) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return processor.Flush(ctx)
 }
