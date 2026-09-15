@@ -62,11 +62,15 @@ call EV-EXT-ERROR '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name
 set +e
 call EV-EXT-CANCEL '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"trigger-long-running-operation","arguments":{"duration":10,"steps":10}}}' "$out/cancel.json" & cancel_pid=$!
 sleep 0.7
-curl --silent --show-error --max-time 5 \
+cancel_status=$(curl --silent --show-error --max-time 5 \
   --header 'Accept: application/json, text/event-stream' --header 'Content-Type: application/json' --header 'MCP-Protocol-Version: 2025-06-18' \
   --header "Mcp-Session-Id: $session_id" \
   --data '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":4,"reason":"spike cancellation"}}' \
-  "$gateway_url" >"$out/cancel-notification.json" || true
+  --output "$out/cancel-notification.json" --write-out '%{http_code}' "$gateway_url")
+if [[ ! "$cancel_status" =~ ^2[0-9][0-9]$ ]]; then
+  echo "cancellation notification returned HTTP $cancel_status" >&2
+  exit 1
+fi
 wait "$cancel_pid" || true
 call EV-EXT-MISSING '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"trigger-long-running-operation","arguments":{"duration":10,"steps":10}}}' "$out/missing.json" & missing_pid=$!
 sleep 0.7
@@ -84,9 +88,29 @@ captures=$(awk '/^{/{line=$0} END{print line}' "$out/server.jsonl")
 test -n "$captures"
 jq -e '.captures | type == "array"' <<<"$captures" >/dev/null
 jq -e 'all(.captures[]; .RawPersisted == false and (has("mcp_request") | not) and (has("mcp_response") | not))' <<<"$captures" >/dev/null
+jq -e '
+  (.captures | length == 4) and
+  ([.captures[].OperationContext] | sort | . == ["EV-EXT-CANCEL", "EV-EXT-ERROR", "EV-EXT-MISSING", "EV-EXT-SUCCESS"]) and
+  ([.captures[] | select(.OperationContext == "EV-EXT-SUCCESS") | {RequestSeen, ResponseSeen}] == [{RequestSeen:true, ResponseSeen:true}]) and
+  ([.captures[] | select(.OperationContext == "EV-EXT-ERROR") | {RequestSeen, ResponseSeen}] == [{RequestSeen:true, ResponseSeen:true}]) and
+  ([.captures[] | select(.OperationContext == "EV-EXT-CANCEL") | {RequestSeen, ResponseSeen}] == [{RequestSeen:true, ResponseSeen:false}]) and
+  ([.captures[] | select(.OperationContext == "EV-EXT-MISSING") | {RequestSeen, ResponseSeen}] == [{RequestSeen:true, ResponseSeen:false}])
+' <<<"$captures" >/dev/null
 if grep -Fq 'EVIDRA_PRIVATE_ARGUMENT_CANARY_EXTMCP_7b0cbb8f' <<<"$captures"; then
   echo 'raw request canary reached machine-readable capture output' >&2
   exit 1
 fi
 jq -n --argjson captures "$(jq -c '.captures' <<<"$captures")" '{version:"agentgateway-v1.5.0",path:"extmcp",rows:[{name:"success echo",operation:"EV-EXT-SUCCESS",start:(([ $captures[]|select(.OperationContext=="EV-EXT-SUCCESS")|select(.RequestSeen==true) ]|length)>0),finish:(([ $captures[]|select(.OperationContext=="EV-EXT-SUCCESS" and .ResponseSeen==true) ]|length)>0),outcome_authoritative:false},{name:"tool_error",operation:"EV-EXT-ERROR",start:(([ $captures[]|select(.OperationContext=="EV-EXT-ERROR" and .RequestSeen==true) ]|length)>0),finish:(([ $captures[]|select(.OperationContext=="EV-EXT-ERROR" and .ResponseSeen==true) ]|length)>0),outcome_authoritative:false},{name:"cancelled slow_then_cancel",operation:"EV-EXT-CANCEL",start:(([ $captures[]|select(.OperationContext=="EV-EXT-CANCEL" and .RequestSeen==true) ]|length)>0),finish:(([ $captures[]|select(.OperationContext=="EV-EXT-CANCEL" and .ResponseSeen==true) ]|length)>0),outcome_authoritative:false},{name:"missing_response disconnect",operation:"EV-EXT-MISSING",start:(([ $captures[]|select(.OperationContext=="EV-EXT-MISSING" and .RequestSeen==true) ]|length)>0),finish:(([ $captures[]|select(.OperationContext=="EV-EXT-MISSING" and .ResponseSeen==true) ]|length)>0),outcome_authoritative:false}],cancellation_notification_sent:true,cancellation_terminal_hook:false,criterion_unmet:"v1.5.0 cancellation notification did not produce CheckResponse; no terminal fallback",response_hook_gaps:["CheckResponse is only called when AgentGateway receives an MCP response; disconnects are start-only.","The ExtMCP request/response API does not expose a terminal outcome field; outcome_authority=false."]}' | tee "$repo_root/testdata/expected/extmcp-spike.json"
+jq -e '
+  .cancellation_notification_sent == true and
+  .cancellation_terminal_hook == false and
+  (.criterion_unmet | type == "string") and
+  (.rows | length == 4) and
+  ([.rows[].operation] | sort | . == ["EV-EXT-CANCEL", "EV-EXT-ERROR", "EV-EXT-MISSING", "EV-EXT-SUCCESS"]) and
+  ([.rows[].operation] | length == (unique | length)) and
+  ([.rows[] | select(.operation == "EV-EXT-SUCCESS") | {start, finish}] == [{start:true, finish:true}]) and
+  ([.rows[] | select(.operation == "EV-EXT-ERROR") | {start, finish}] == [{start:true, finish:true}]) and
+  ([.rows[] | select(.operation == "EV-EXT-CANCEL") | {start, finish}] == [{start:true, finish:false}]) and
+  ([.rows[] | select(.operation == "EV-EXT-MISSING") | {start, finish}] == [{start:true, finish:false}])
+' "$repo_root/testdata/expected/extmcp-spike.json" >/dev/null
 echo 'ExtMCP E2E passed; machine-readable result written to testdata/expected/extmcp-spike.json'
