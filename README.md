@@ -1,5 +1,7 @@
 # evidra-agentgateway-bridge
 
+Status: experimental AgentGateway observation adapter. Its JSONL output is not yet an Evidra Evidence v2 store and is not consumed by `evidra summarize`.
+
 OTLP receiver that turns AgentGateway telemetry into normalized records of observed MCP tool
 executions.
 

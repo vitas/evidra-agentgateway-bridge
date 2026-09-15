@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -17,16 +19,30 @@ import (
 	"github.com/vitas/evidra-agentgateway-bridge/internal/otlpgrpc"
 	"github.com/vitas/evidra-agentgateway-bridge/internal/otlphttp"
 	"github.com/vitas/evidra-agentgateway-bridge/internal/sink"
+	"github.com/vitas/evidra-agentgateway-bridge/internal/version"
 )
 
 func main() {
+	os.Exit(run(os.Args[1:], os.Stdout))
+}
+
+func run(args []string, stdout io.Writer) int {
+	if len(args) == 1 && args[0] == "--version" {
+		_, _ = fmt.Fprintf(stdout, "evidra-agentgateway %s\n", version.Version)
+		return 0
+	}
+
 	cfg := config.LoadConfig()
 
 	out, err := sink.NewJSONL(cfg.ObservationsPath)
 	if err != nil {
 		log.Fatalf("observations sink: %v", err)
 	}
-	defer out.Close()
+	defer func() {
+		if err := out.Close(); err != nil {
+			log.Printf("close observations sink: %v", err)
+		}
+	}()
 
 	processor := bridge.NewProcessor(out, cfg.MergeWait)
 	processor.SetObserver(cfg.ObserverID, cfg.ObserverVersion)
@@ -88,4 +104,6 @@ func main() {
 	stats := processor.Stats()
 	raw, _ := json.Marshal(stats)
 	log.Printf("final stats: %s", raw)
+
+	return 0
 }
