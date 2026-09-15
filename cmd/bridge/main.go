@@ -42,8 +42,25 @@ type processorFlusher interface {
 type shutdownResult struct {
 	httpErr       error
 	flushErr      error
+	closeErr      error
 	grpcForced    bool
 	flushTimedOut bool
+}
+
+// exitCode treats every incomplete drain as a failed process shutdown. A forced gRPC stop is
+// bounded and intentional, but it interrupts active RPCs, so it cannot truthfully report success.
+func (r shutdownResult) exitCode() int {
+	if r.httpErr != nil || r.flushErr != nil || r.closeErr != nil || r.grpcForced {
+		return 1
+	}
+	return 0
+}
+
+func finalizeShutdown(result shutdownResult, closeOutput func() error) shutdownResult {
+	if !result.flushTimedOut {
+		result.closeErr = closeOutput()
+	}
+	return result
 }
 
 func main() {
@@ -62,16 +79,6 @@ func run(args []string, stdout io.Writer) int {
 	if err != nil {
 		log.Fatalf("observations sink: %v", err)
 	}
-	closeOutput := true
-	defer func() {
-		if !closeOutput {
-			return
-		}
-		if err := out.Close(); err != nil {
-			log.Printf("close observations sink: %v", err)
-		}
-	}()
-
 	processor := bridge.NewProcessor(out, cfg.MergeWait)
 	processor.SetObserver(cfg.ObserverID, cfg.ObserverVersion)
 	log.Printf("normalizing OTLP logs and traces into %s (merge wait %s)", cfg.ObservationsPath, cfg.MergeWait)
@@ -124,12 +131,9 @@ func run(args []string, stdout io.Writer) int {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	result := shutdownServices(shutdownCtx, server, grpcSrv, processor)
-	if result.flushTimedOut {
-		// run is called only by main, which immediately calls os.Exit with its result. Do not
-		// race Close against a regular-file write that ignored cancellation; process exit is
-		// the only safe hard stop available for such an I/O operation.
-		closeOutput = false
-	}
+	// A timed-out regular-file write cannot be canceled safely. In that one case, skip Close and
+	// return failure so main can terminate the process without racing the in-flight write.
+	result = finalizeShutdown(result, out.Close)
 	if result.httpErr != nil {
 		log.Printf("HTTP shutdown: %v", result.httpErr)
 	}
@@ -139,6 +143,9 @@ func run(args []string, stdout io.Writer) int {
 	if result.flushErr != nil {
 		log.Printf("flush: %v", result.flushErr)
 	}
+	if result.closeErr != nil {
+		log.Printf("close observations sink: %v", result.closeErr)
+	}
 	stats := processor.Stats()
 	raw, _ := json.Marshal(stats)
 	if result.flushTimedOut {
@@ -147,7 +154,7 @@ func run(args []string, stdout io.Writer) int {
 		log.Printf("final stats: %s", raw)
 	}
 
-	return 0
+	return result.exitCode()
 }
 
 func shutdownServices(

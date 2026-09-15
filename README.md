@@ -136,6 +136,11 @@ that forwarded nothing look like one that was merely unconfigured.
 go run ./cmd/bridge
 ```
 
+On `SIGINT` or `SIGTERM`, the bridge drains HTTP and gRPC, flushes pending observations, and
+closes the JSONL sink within one 10-second budget. It exits nonzero if HTTP drain, persistence,
+or sink close fails. A gRPC forced stop at the deadline also exits nonzero because active RPCs
+may have been interrupted; a timed-out persistence write is not raced with `Close`.
+
 The reproducible AgentGateway parity run builds the local bridge and a test-only AgentGateway
 image, starts the committed topology, sends one successful and one failing MCP tool call, drains
 the telemetry pipeline, and checks the exact counters and privacy canaries:

@@ -6,6 +6,7 @@ package extmcp
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	api "github.com/vitas/evidra-agentgateway-bridge/internal/extmcp/api"
@@ -46,9 +47,7 @@ func (s *Store) mark(operation string, services []string, method string, start, 
 	capture.ResponseSeen = capture.ResponseSeen || finish
 }
 
-// Snapshot returns copies in insertion order by the stable operation context.
-// The spike uses one request per operation, so map ordering is irrelevant to
-// the decision and callers sort by OperationContext when needed.
+// Snapshot returns copies sorted by the stable operation context.
 func (s *Store) Snapshot() []Capture {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -56,6 +55,9 @@ func (s *Store) Snapshot() []Capture {
 	for _, capture := range s.captures {
 		result = append(result, *capture)
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].OperationContext < result[j].OperationContext
+	})
 	return result
 }
 

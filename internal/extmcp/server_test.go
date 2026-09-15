@@ -2,12 +2,28 @@ package extmcp
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	api "github.com/vitas/evidra-agentgateway-bridge/internal/extmcp/api"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+func TestSnapshotIsSortedByOperationContext(t *testing.T) {
+	store := NewStore()
+	for _, operation := range []string{"z-last", "a-first", "m-middle"} {
+		store.mark(operation, []string{"everything"}, "tools/call", true, false)
+	}
+
+	got := make([]string, 0, 3)
+	for _, capture := range store.Snapshot() {
+		got = append(got, capture.OperationContext)
+	}
+	if want := []string{"a-first", "m-middle", "z-last"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot order = %v, want %v", got, want)
+	}
+}
 
 func TestServerCaptureMatrix(t *testing.T) {
 	tests := []struct {

@@ -33,6 +33,10 @@ type immediateHTTPShutdown struct{}
 
 func (immediateHTTPShutdown) Shutdown(context.Context) error { return nil }
 
+type failingHTTPShutdown struct{ err error }
+
+func (s failingHTTPShutdown) Shutdown(context.Context) error { return s.err }
+
 type immediateGRPCShutdown struct{}
 
 func (immediateGRPCShutdown) GracefulStop() {}
@@ -41,6 +45,76 @@ func (immediateGRPCShutdown) Stop()         {}
 type immediateFlush struct{}
 
 func (immediateFlush) Flush(context.Context) error { return nil }
+
+type failingFlush struct{ err error }
+
+func (f failingFlush) Flush(context.Context) error { return f.err }
+
+func TestShutdownFailureExitSemantics(t *testing.T) {
+	httpErr := errors.New("HTTP drain failed")
+	flushErr := errors.New("persistence failed")
+
+	tests := []struct {
+		name   string
+		result shutdownResult
+		want   int
+	}{
+		{name: "normal shutdown", result: shutdownResult{}, want: 0},
+		{name: "HTTP drain failure", result: shutdownResult{httpErr: httpErr}, want: 1},
+		{name: "persistence failure", result: shutdownResult{flushErr: flushErr}, want: 1},
+		{name: "persistence timeout", result: shutdownResult{flushErr: errFlushDeadline, flushTimedOut: true}, want: 1},
+		{name: "forced gRPC stop", result: shutdownResult{grpcForced: true}, want: 1},
+		{name: "sink close failure", result: shutdownResult{closeErr: errors.New("close failed")}, want: 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.result.exitCode(); got != tc.want {
+				t.Fatalf("exit code = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFinalizeShutdownReportsCloseFailure(t *testing.T) {
+	want := errors.New("close failed")
+	result := finalizeShutdown(shutdownResult{}, func() error { return want })
+	if !errors.Is(result.closeErr, want) {
+		t.Fatalf("close error = %v, want %v", result.closeErr, want)
+	}
+	if got := result.exitCode(); got == 0 {
+		t.Fatal("close failure returned a successful exit code")
+	}
+}
+
+func TestFinalizeShutdownDoesNotRaceCloseAfterFlushTimeout(t *testing.T) {
+	closed := false
+	result := finalizeShutdown(shutdownResult{flushErr: errFlushDeadline, flushTimedOut: true}, func() error {
+		closed = true
+		return nil
+	})
+	if closed {
+		t.Fatal("sink was closed while a timed-out flush may still be writing")
+	}
+	if got := result.exitCode(); got == 0 {
+		t.Fatal("persistence-not-confirmed timeout returned a successful exit code")
+	}
+}
+
+func TestShutdownServicesPropagatesHTTPAndFlushFailures(t *testing.T) {
+	httpErr := errors.New("HTTP drain failed")
+	flushErr := errors.New("persistence failed")
+	result := shutdownServices(context.Background(), failingHTTPShutdown{httpErr}, immediateGRPCShutdown{}, failingFlush{flushErr})
+	if !errors.Is(result.httpErr, httpErr) {
+		t.Fatalf("HTTP error = %v, want %v", result.httpErr, httpErr)
+	}
+	if !errors.Is(result.flushErr, flushErr) {
+		t.Fatalf("flush error = %v, want %v", result.flushErr, flushErr)
+	}
+	if got := result.exitCode(); got == 0 {
+		t.Fatal("shutdown failures returned a successful exit code")
+	}
+}
 
 type blockedGracefulStop struct {
 	started  chan struct{}
